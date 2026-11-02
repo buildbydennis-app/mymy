@@ -1,9 +1,6 @@
-import 'dart:io' show Platform;
-
 import 'package:flutter/services.dart';
 
 import 'models.dart';
-import 'windows_usage.dart' as windows;
 
 /// The only thing the UI ever talks to for usage data.
 ///
@@ -16,11 +13,27 @@ abstract class UsageDataSource {
   Future<UsageSnapshot> getSnapshot();
 }
 
-/// The native platform-channel source used on Android.
+/// Background sampling (Android foreground service) channel methods.
 ///
-/// On Windows this channel has no native handler, so [UsageService.resolve]
-/// never selects this source there (see [windows.WindowsUsageDataSource]).
-class MethodChannelUsageDataSource implements UsageDataSource {
+/// Kept separate from [UsageDataSource] so fakes and non-Android
+/// platforms are not forced to implement them. On a platform whose
+/// native handler does not implement a method, the call degrades to
+/// false / empty instead of crashing.
+abstract class BackgroundSamplingSource {
+  Future<bool> startBackgroundSampling();
+  Future<bool> stopBackgroundSampling();
+  Future<bool> isBackgroundSampling();
+  Future<List<String>> getBackgroundSamples();
+  Future<void> clearBackgroundSamples();
+}
+
+/// The native platform-channel source.
+///
+/// Android: MainActivity.kt. Windows (Phase 2): the runner's native
+/// collector in windows/runner/mymy_usage.cpp. Any other platform:
+/// no handler, so [getStatus] reports 'unimplemented'.
+class MethodChannelUsageDataSource
+    implements UsageDataSource, BackgroundSamplingSource {
   MethodChannelUsageDataSource({MethodChannel? channel})
       : _channel = channel ?? const MethodChannel('mymy/usage');
 
@@ -57,6 +70,54 @@ class MethodChannelUsageDataSource implements UsageDataSource {
       throw StateError('mymy/usage getSnapshot returned no data');
     }
     return UsageSnapshot.fromJson(Map<String, dynamic>.from(raw));
+  }
+
+  @override
+  Future<bool> startBackgroundSampling() async {
+    try {
+      return await _channel.invokeMethod<bool>('startBackgroundSampling') ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> stopBackgroundSampling() async {
+    try {
+      return await _channel.invokeMethod<bool>('stopBackgroundSampling') ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> isBackgroundSampling() async {
+    try {
+      return await _channel.invokeMethod<bool>('isBackgroundSampling') ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<List<String>> getBackgroundSamples() async {
+    try {
+      final raw =
+          await _channel.invokeListMethod<String>('getBackgroundSamples');
+      return raw ?? const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  @override
+  Future<void> clearBackgroundSamples() async {
+    try {
+      await _channel.invokeMethod<void>('clearBackgroundSamples');
+    } catch (_) {}
   }
 
   UsageStatus _unimplementedStatus() => const UsageStatus(
@@ -100,19 +161,15 @@ class UsageService {
   UsageService({UsageDataSource? source})
       : _source = source ?? resolveSource();
 
-  /// Picks the right source for the running platform.
-  ///
-  /// Windows goes to the Dart/FFI collector (Phase 1: adapter totals +
-  /// active connections; per-process bytes are Phase 2). Everything else
-  /// goes to the platform channel, which is only implemented on Android
-  /// today — other platforms get the explicit "not available" status
-  /// instead of demo data.
-  static UsageDataSource resolveSource() {
-    if (Platform.isWindows) return windows.WindowsUsageDataSource();
-    return MethodChannelUsageDataSource();
-  }
+  /// The platform channel is the source on every platform now:
+  /// Android (MainActivity.kt) and Windows Phase 2 (runner native
+  /// collector) both implement it. A platform with no handler gets the
+  /// explicit "not available" status instead of demo data.
+  static UsageDataSource resolveSource() => MethodChannelUsageDataSource();
 
   final UsageDataSource _source;
+
+  UsageDataSource get source => _source;
   UsageSnapshot? _previous;
 
   Future<UsageStatus> getStatus() => _source.getStatus();

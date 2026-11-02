@@ -5,14 +5,20 @@ internet usage per app in a live dashboard. See
 [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) for the full phased plan,
 including the honest platform limits.
 
-**Phase 1 status (local only, not pushed to GitHub yet):**
+**Phase 2 status (local only, NOT pushed to GitHub):**
 
 - ✅ Android: live dashboard, device totals, mobile vs Wi-Fi split,
   per-app totals for today, live rates from 1-second polling deltas of
   real system counters.
-- ⏳ Windows: the app builds, but the dashboard honestly says Windows
-  usage is not implemented yet. Per-process bytes are Phase 2 (native
-  ETW / IP Helper collector, built and tested on Windows).
+- ✅ Windows: native collector in the runner (adapter totals +
+  per-process **TCP** bytes via EStats, run as administrator).
+  UDP per-process bytes are NOT measured in Phase 2 — ETW is still
+  pending, and the UI says so. Windows behaviour is NOT proven here;
+  it needs a real laptop + the Actions Windows build.
+- ✅ History tab: today / yesterday / last 7 days (recorded while
+  sampling), per-app today, biggest user today, daily cap banner.
+- ✅ Android background sampling: foreground service, 1 sample/min,
+  merged into history on reopen (never double-counted).
 - ❌ iOS: no per-app usage API exists for ordinary App Store apps, so
   iOS is out of scope. See the plan doc.
 
@@ -31,17 +37,17 @@ Android app deliberately has **no `INTERNET` permission**.
 Windows toolchain, which the Linux dev VM does not have — GitHub
 Actions (below) is the first real build for both.
 
-## Download (once the repo is connected)
+## Download (once the pending web upload lands)
 
-GitHub Actions, on every push to `main` (workflows are pinned to
-Flutter 3.47.6):
+GitHub Actions, **manual-only** — nothing runs on push (workflows are
+pinned to Flutter 3.47.6). Run a workflow from Actions → Run workflow:
 
 - **Android APK:** Actions → `Build APK` run → artifact
   `mymy-app-release-apk` → install `app-release.apk` (debug-key signed,
   so it installs without a release keystore).
 - **Windows:** Actions → `Build Windows` run → artifact
   `mymy-windows-release` → the release folder with `mymy.exe`.
-  Phase 1 Windows shows the not-implemented card (expected).
+  Run it as administrator for per-process TCP bytes.
 
 Note: if pushing via the API returns 403 for `.github/workflows/`,
 add those two workflow files via the GitHub web UI instead
@@ -51,5 +57,7 @@ add those two workflow files via the GitHub web UI instead
 
 - **Android:** open the app, tap "Open usage settings", grant usage
   access. Without it you get device totals only, no per-app list.
-- **Windows (Phase 2):** run as administrator for per-process TCP byte
-  counts.
+  For background sampling, also grant notifications (Android 13+),
+  or the service switch will not stay on.
+- **Windows:** run as administrator for per-process TCP byte
+  counts. Without it you get adapter totals + connections only.
