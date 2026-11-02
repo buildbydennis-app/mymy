@@ -21,18 +21,24 @@
          notification shows while the VPN is active. -->
     <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <!-- Deliberately NO android.permission.INTERNET: this app must not
-         send usage data anywhere. Note on the VPN design: relay
-         sockets are created with VpnService.protect() so they bypass
-         the tunnel instead of looping into it; they carry other apps'
-         traffic to its original destination, they are not the app's
-         own network calls, and no usage data is ever transmitted.
-         Whether Android permits those protected relay sockets without
-         INTERNET is the top Phase 3 device-test item — if relay
-         sockets are denied on a real phone, adding INTERNET (with a
-         written justification in the plan) is the first fix to try,
-         and VPN mode must stay visibly failed until then, never
-         silently degraded. -->
+    <!-- Phase 4 LAN-only INTERNET permission — READ BEFORE REMOVING
+         OR EXPANDING IT. Phases 1–3 deliberately had NO INTERNET
+         permission, and that is still true for everything except
+         Phase 4's local-LAN sharing: Android requires INTERNET for
+         an app to open sockets at all, including a LAN-only
+         HttpServer/HttpClient pair between the user's own devices.
+         Scope of this permission as used by MyMy: the Devices tab's
+         LAN host (bound to a LAN address only) and guest client,
+         talking only to a paired device on the same trusted Wi-Fi,
+         token-gated, totals + per-app bytes only. It is NOT used to
+         contact any remote server, and no usage data is ever sent
+         to the internet. If Phase 4 is ever removed, this permission
+         must be removed with it. VPN relay sockets (Phase 3) are a
+         separate question: they are protect()ed, and whether they
+         need INTERNET on a real phone is still the Phase 3
+         device-test item — Phase 4's INTERNET grant does not prove
+         or change that test, it only enables LAN sharing. -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <application
         android:label="mymy"
         android:name="${applicationName}"

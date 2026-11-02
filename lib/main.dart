@@ -1,9 +1,12 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import 'src/background.dart';
 import 'src/budget.dart';
+import 'src/devices.dart';
 import 'src/format.dart';
 import 'src/history.dart';
 import 'src/models.dart';
@@ -449,7 +452,7 @@ class _DashboardPageState extends State<DashboardPage> {
   Widget build(BuildContext context) {
     final status = _status;
     return DefaultTabController(
-      length: 2,
+      length: 3,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('MyMy — Live Data Usage'),
@@ -464,6 +467,7 @@ class _DashboardPageState extends State<DashboardPage> {
             tabs: [
               Tab(text: 'Live'),
               Tab(text: 'History'),
+              Tab(text: 'Devices'),
             ],
           ),
         ),
@@ -482,6 +486,18 @@ class _DashboardPageState extends State<DashboardPage> {
                     onMerge: () async {
                       _mergedOnce = false;
                       await _maybeMergeBackground();
+                    },
+                  ),
+                  DevicesTab(
+                    getLocalSnapshot: () => _service.source.getSnapshot(),
+                    getTodayTotal: () async {
+                      final history = _history;
+                      if (history == null) return null;
+                      final summary = await history.summary();
+                      return (
+                        rx: summary.today.rxBytes,
+                        tx: summary.today.txBytes,
+                      );
                     },
                   ),
                 ],
@@ -830,6 +846,671 @@ class _HistoryTabState extends State<HistoryTab> {
       ],
     );
   }
+}
+
+/// Phase 4 — Devices tab: optional local-LAN cross-device view.
+///
+/// This device keeps measuring itself exactly as before. A remote
+/// device is only shown after explicit pairing on both sides, and
+/// only while its host is running. Remote totals are NEVER written
+/// into this device's history — they are displayed only, from live
+/// polls every 5 seconds while this tab is open (not in the
+/// background). A remote device that stops answering is Stale or
+/// Offline with its last-seen time; its rates are forced to 0, never
+/// a frozen rate presented as live.
+class DevicesTab extends StatefulWidget {
+  const DevicesTab({
+    super.key,
+    required this.getLocalSnapshot,
+    required this.getTodayTotal,
+    this.store,
+    this.fetcher,
+  });
+
+  final Future<UsageSnapshot> Function() getLocalSnapshot;
+  final Future<({int rx, int tx})?> Function() getTodayTotal;
+
+  /// Injected in tests; otherwise SharedPreferences-backed.
+  final DevicesStore? store;
+  final RemoteFetcher? fetcher;
+
+  @override
+  State<DevicesTab> createState() => _DevicesTabState();
+}
+
+class _DevicesTabState extends State<DevicesTab> {
+  DevicesStore? _store;
+  List<PairedDevice> _paired = [];
+  String _ownLabel = defaultDeviceLabel();
+  final _ownLabelController = TextEditingController();
+  LanHostServer? _host;
+  String? _hostError;
+  bool _hostStarting = false;
+  final Map<String, RemoteDevicePoller> _pollers = {};
+  final Map<String, LiveUsage> _views = {};
+  Timer? _pollTimer;
+
+  bool _showJoin = false;
+  String _joinError = '';
+  final _payloadController = TextEditingController();
+  final _hostController = TextEditingController();
+  final _portController = TextEditingController();
+  final _pinController = TextEditingController();
+  final _joinLabelController = TextEditingController();
+
+  RemoteFetcher get _fetcher => widget.fetcher ?? HttpRemoteFetcher();
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.store != null) {
+      _store = widget.store;
+      _loadPaired();
+    } else {
+      PrefsDevicesStore.load().then((store) {
+        if (!mounted) return;
+        setState(() => _store = store);
+        _loadPaired();
+      });
+    }
+  }
+
+  Future<void> _loadPaired() async {
+    final store = _store;
+    if (store == null) return;
+    final label = await store.getDeviceLabel();
+    final paired = await store.getPairedDevices();
+    if (!mounted) return;
+    setState(() {
+      if (label != null && label.isNotEmpty) _ownLabel = label;
+      _ownLabelController.text = _ownLabel;
+      _paired = paired;
+      for (final device in paired) {
+        _pollers.putIfAbsent(device.id, () => RemoteDevicePoller(device));
+      }
+    });
+    await _pollAll();
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) => _pollAll());
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    final host = _host;
+    if (host != null) unawaited(host.stop());
+    _ownLabelController.dispose();
+    _payloadController.dispose();
+    _hostController.dispose();
+    _portController.dispose();
+    _pinController.dispose();
+    _joinLabelController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pollAll() async {
+    for (final device in _paired) {
+      final poller = _pollers.putIfAbsent(
+        device.id,
+        () => RemoteDevicePoller(device),
+      );
+      final view = await poller.poll(_fetcher, DateTime.now());
+      if (!mounted) return;
+      setState(() => _views[device.id] = view);
+    }
+  }
+
+  Future<void> _startHosting() async {
+    setState(() {
+      _hostStarting = true;
+      _hostError = null;
+    });
+    try {
+      final server = LanHostServer(
+        snapshotProvider: widget.getLocalSnapshot,
+        todayProvider: widget.getTodayTotal,
+        deviceLabel: _ownLabel,
+      );
+      await server.start();
+      if (!mounted) {
+        await server.stop();
+        return;
+      }
+      setState(() {
+        _host = server;
+        _hostStarting = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _hostError = e.toString();
+        _hostStarting = false;
+      });
+    }
+  }
+
+  Future<void> _stopHosting() async {
+    final server = _host;
+    setState(() => _host = null);
+    await server?.stop();
+  }
+
+  Future<void> _saveOwnLabel() async {
+    final store = _store;
+    if (store == null) return;
+    final label = _ownLabelController.text.trim();
+    if (label.isEmpty) return;
+    await store.setDeviceLabel(label);
+    if (!mounted) return;
+    setState(() => _ownLabel = label);
+  }
+
+  Future<void> _join() async {
+    final store = _store;
+    if (store == null) {
+      setState(() => _joinError = 'Devices storage is still loading. Try again in a moment.');
+      return;
+    }
+    var host = _hostController.text.trim();
+    var port = int.tryParse(_portController.text.trim());
+    var pin = _pinController.text.trim();
+    var label = _joinLabelController.text.trim();
+    final payloadText = _payloadController.text.trim();
+    if (payloadText.isNotEmpty) {
+      try {
+        final payload = PairingPayload.parse(payloadText);
+        host = payload.host;
+        port = payload.port;
+        pin = payload.pin;
+        if (label.isEmpty) label = payload.label;
+      } catch (e) {
+        setState(() => _joinError = e.toString());
+        return;
+      }
+    }
+    if (host.isEmpty || port == null || pin.isEmpty) {
+      setState(() => _joinError = 'Enter host, port, and PIN — or paste a full pairing code.');
+      return;
+    }
+    setState(() => _joinError = '');
+    try {
+      final token = await _fetcher.pair(host: host, port: port, pin: pin);
+      final device = PairedDevice(
+        id: '$host:$port',
+        label: label.isEmpty ? host : label,
+        host: host,
+        port: port,
+        token: token,
+      );
+      await store.savePairedDevice(device);
+      if (!mounted) return;
+      setState(() {
+        _paired = [
+          for (final d in _paired)
+            if (d.id != device.id) d,
+          device,
+        ];
+        _pollers[device.id] = RemoteDevicePoller(device);
+        _showJoin = false;
+        _joinError = '';
+      });
+      await _pollAll();
+    } catch (e) {
+      if (mounted) setState(() => _joinError = e.toString());
+    }
+  }
+
+  Future<void> _forget(PairedDevice device) async {
+    await _store?.removePairedDevice(device.id);
+    if (!mounted) return;
+    setState(() {
+      _paired = [for (final d in _paired) if (d.id != device.id) d];
+      _pollers.remove(device.id);
+      _views.remove(device.id);
+    });
+  }
+
+  Future<void> _rename(PairedDevice device) async {
+    final controller = TextEditingController(text: device.label);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rename device'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(labelText: 'Device name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (result == null || result.isEmpty) return;
+    final renamed = device.renamed(result);
+    await _store?.savePairedDevice(renamed);
+    if (!mounted) return;
+    setState(() {
+      _paired = [
+        for (final d in _paired) d.id == device.id ? renamed : d,
+      ];
+    });
+  }
+
+  String _formatTime(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    if (_store == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final host = _host;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'This device',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Your own name for this device, shown to devices you '
+                  'pair with. It is just a label — change it freely.',
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _ownLabelController,
+                        decoration: const InputDecoration(
+                          labelText: 'Device name',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: _saveOwnLabel,
+                      child: const Text('Save'),
+                    ),
+                  ],
+                ),
+                if (host != null)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text(
+                      'Restart hosting after renaming for guests to see '
+                      'the new name.',
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (host != null) ...[
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Hosting — other devices can pair',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                  ),
+                  const SizedBox(height: 4),
+                  Text('Endpoint: ${host.endpoint}'),
+                  const SizedBox(height: 12),
+                  Center(
+                    child: QrImageView(
+                      data: host.pairingPayload,
+                      version: QrVersions.auto,
+                      size: 200,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'PIN: ${host.pin}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 24,
+                    ),
+                  ),
+                  Text(
+                    'PIN expires around ${_formatTime(host.pinExpiresAt)} '
+                    '(2 minutes, single use). Show this screen to the '
+                    'other device, or copy the code below.',
+                  ),
+                  const SizedBox(height: 8),
+                  SelectableText(host.pairingPayload),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      FilledButton(
+                        onPressed: () => Clipboard.setData(
+                          ClipboardData(text: host.pairingPayload),
+                        ),
+                        child: const Text('Copy pairing code'),
+                      ),
+                      OutlinedButton(
+                        onPressed: () => setState(host.regeneratePin),
+                        child: const Text('New PIN'),
+                      ),
+                      TextButton(
+                        onPressed: _stopHosting,
+                        child: const Text('Stop hosting & revoke'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Stopping hosting revokes every guest token at once. '
+                    'Sharing is LAN + token only — there is no TLS in '
+                    'Phase 4, so do not pair on untrusted or public '
+                    'Wi-Fi. Shared: totals + per-app bytes only. Never '
+                    'shared: traffic content, URLs, hosts, DNS, '
+                    'browsing history, or connection details.',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ] else ...[
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Share this device on your LAN',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Start hosting and the other device can pair with '
+                    'the PIN above. Hosting runs only while this app '
+                    'stays open on this tab.',
+                  ),
+                  if (_hostError != null) ...[
+                    const SizedBox(height: 8),
+                    Text(_hostError!),
+                  ],
+                  const SizedBox(height: 12),
+                  FilledButton(
+                    onPressed: _hostStarting ? null : _startHosting,
+                    child: Text(_hostStarting ? 'Starting…' : 'Host this device'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+        const SizedBox(height: 12),
+        if (_paired.isEmpty && host == null)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'No paired devices yet',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    'Pair a phone and a laptop on the same trusted Wi-Fi '
+                    'to see both totals side by side. Host on one '
+                    'device, join from the other. Nothing is shared '
+                    'with any cloud, and either side can stop at any '
+                    'time.',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        for (final device in _paired) _RemoteDeviceCard(
+          device: device,
+          view: _views[device.id],
+          poller: _pollers[device.id],
+          formatTime: _formatTime,
+          onForget: () => _forget(device),
+          onRename: () => _rename(device),
+        ),
+        const SizedBox(height: 12),
+        if (!_showJoin)
+          OutlinedButton(
+            onPressed: () => setState(() => _showJoin = true),
+            child: const Text('Join a device'),
+          )
+        else
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Join a device',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Phase 4 has no camera scan: paste the host\'s full '
+                    'pairing code, or enter host, port, and PIN '
+                    'manually. This works on Windows too, with no '
+                    'camera needed.',
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _payloadController,
+                    decoration: const InputDecoration(
+                      labelText: 'Pairing code (paste, optional)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _hostController,
+                    decoration: const InputDecoration(
+                      labelText: 'Host IP (e.g. 192.168.1.10)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _portController,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'Port',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: TextField(
+                          controller: _pinController,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'PIN',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _joinLabelController,
+                    decoration: const InputDecoration(
+                      labelText: 'Name for this device (optional)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  if (_joinError.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(_joinError),
+                  ],
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      FilledButton(
+                        onPressed: _join,
+                        child: const Text('Pair'),
+                      ),
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: () => setState(() {
+                          _showJoin = false;
+                          _joinError = '';
+                        }),
+                        child: const Text('Cancel'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _RemoteDeviceCard extends StatelessWidget {
+  const _RemoteDeviceCard({
+    required this.device,
+    required this.view,
+    required this.poller,
+    required this.formatTime,
+    required this.onForget,
+    required this.onRename,
+  });
+
+  final PairedDevice device;
+  final LiveUsage? view;
+  final RemoteDevicePoller? poller;
+  final String Function(DateTime) formatTime;
+  final VoidCallback onForget;
+  final VoidCallback onRename;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = poller?.statusAt(DateTime.now()) ?? 'Offline';
+    final snapshot = view?.snapshot;
+    final latest = poller?.latest;
+    final topApps = snapshot == null
+        ? const <AppUsage>[]
+        : ([...snapshot.apps]
+          ..sort((a, b) => b.totalBytes.compareTo(a.totalBytes))).take(5).toList();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    device.label,
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                  ),
+                ),
+                Text(status),
+              ],
+            ),
+            if (status != 'Online') ...[
+              const SizedBox(height: 4),
+              Text(
+                poller?.lastSeen == null
+                    ? 'Never reached. Check the host is open and on the same Wi-Fi.'
+                    : 'Last seen ${_formatTimeSafe(poller!.lastSeen!)}. Rates are paused, not live.',
+              ),
+            ],
+            if (snapshot != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _Stat(
+                      label: 'Download rate',
+                      value: formatRate(view?.rxBytesPerSecond ?? 0),
+                    ),
+                  ),
+                  Expanded(
+                    child: _Stat(
+                      label: 'Upload rate',
+                      value: formatRate(view?.txBytesPerSecond ?? 0),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _StatRow(
+                label: 'Device totals (since boot / collector start)',
+                value: formatBytes(snapshot.totalBytes),
+              ),
+              _StatRow(
+                label: 'Today (recorded on that device)',
+                value: latest?.todayRxBytes == null || latest?.todayTxBytes == null
+                    ? '—'
+                    : formatBytes(latest!.todayRxBytes! + latest.todayTxBytes!),
+              ),
+              const SizedBox(height: 8),
+              const Text('Top apps', style: TextStyle(fontWeight: FontWeight.bold)),
+              if (topApps.isEmpty)
+                const Text('No per-app data from this device yet.')
+              else
+                for (final app in topApps)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(app.name.isEmpty ? app.id : app.name),
+                    trailing: Text(formatBytes(app.totalBytes)),
+                  ),
+            ] else ...[
+              const SizedBox(height: 8),
+              const Text('Waiting for the first poll from this device…'),
+            ],
+            if (poller?.lastError != null && status != 'Online') ...[
+              const SizedBox(height: 4),
+              Text(poller!.lastError!),
+            ],
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                TextButton(onPressed: onRename, child: const Text('Rename')),
+                TextButton(onPressed: onForget, child: const Text('Forget')),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatTimeSafe(DateTime t) => formatTime(t);
 }
 
 class _HistoryTotalsCard extends StatelessWidget {

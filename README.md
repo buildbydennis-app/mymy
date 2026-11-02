@@ -5,7 +5,7 @@ internet usage per app in a live dashboard. See
 [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) for the full phased plan,
 including the honest platform limits.
 
-**Phase 3 status (local only, NOT pushed to GitHub):**
+**Phase 4 status (local only, NOT pushed to GitHub):**
 
 - ✅ Android: live dashboard, device totals, mobile vs Wi-Fi split,
   per-app totals for today, live rates from 1-second polling deltas of
@@ -33,9 +33,38 @@ including the honest platform limits.
   is the first fix to try). Exact device tests are in the plan doc.
 - ❌ iOS: no per-app usage API exists for ordinary App Store apps, so
   iOS is out of scope. See the plan doc.
+- ✅ Devices tab (Phase 4, opt-in local-LAN cross-device view): host
+  on one device (LAN-only server, QR code + 6-digit PIN that expires
+  in 2 minutes and is single-use), join from the other by pasting
+  the pairing code or entering host + port + PIN manually (no camera
+  scan — manual entry works on Windows too). Paired devices show
+  live rate (5-second polls while the tab is open), totals, today
+  recorded total, and top apps; a silent device shows Stale/Offline
+  with last-seen, never a frozen rate as live. Remote totals are
+  never written into this device's history. Either side can revoke
+  at any time. **NOT proven:** real two-device pairing on a phone +
+  laptop, Windows Firewall prompts, and token/PIN behaviour on a
+  real network — exact two-device tests are in the plan doc.
 
-**Privacy:** all data stays on the device. No server, no account. The
-Android app deliberately has **no `INTERNET` permission**.
+**Privacy:** all data stays on the device, or — only while two of
+your own devices are explicitly paired — on your local LAN between
+them. No server, no account, no cloud. Shared over the LAN: totals +
+per-app bytes only. Never shared: traffic content, URLs, hosts, DNS,
+browsing history, or connection details.
+
+**Phase 4 permission change, read this:** Phases 1–3 deliberately had
+no `INTERNET` permission. Phase 4 adds it, **LAN-only**: Android
+requires `INTERNET` for an app to open sockets at all, including a
+LAN-only host/client pair between your own devices. It is used only
+for the Devices tab's LAN host (bound to a LAN address) and guest
+client on the same trusted Wi-Fi, token-gated. No usage data is ever
+sent to the internet, and there is no remote server. If Phase 4 is
+ever removed, this permission must be removed with it.
+
+**Phase 4 security, stated plainly:** LAN + bearer token ONLY — there
+is **no TLS / end-to-end encryption** in Phase 4. Treat the bearer
+token like a LAN password, and **do not pair on untrusted or public
+Wi-Fi**.
 
 ## Run / test locally
 
@@ -78,3 +107,9 @@ add those two workflow files via the GitHub web UI instead
   off (Live tab or its notification) returns to polling. While it
   is active, any other VPN is disconnected — Android allows only
   one VPN at a time.
+- **Devices (Phase 4):** Devices tab → Host this device on one device,
+  Join a device on the other (paste the pairing code, or enter host +
+  port + PIN). Both devices must be on the same trusted Wi-Fi.
+  Stop hosting (or Forget on the guest) revokes the pairing at any
+  time. On Windows, allow MyMy on **private** networks only when
+  Firewall prompts — never on public networks.

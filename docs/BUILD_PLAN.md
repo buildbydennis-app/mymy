@@ -6,13 +6,13 @@ is using right now and in total. One codebase, one dashboard UI, a
 different native collector per platform. All data stays on the device.
 There is no server, no account, and no data leaves the phone or laptop.
 
-**Status: Phase 3 built locally, NOT pushed to GitHub** (this tree is
+**Status: Phase 4 built locally, NOT pushed to GitHub** (this tree is
 local-only by instruction; workflows are manual-only and pending a
 separate web upload). `flutter analyze` + `flutter test` are the local
 proof so far; a real device / real Windows machine is still required
 before any "it works" claim (see § Testing). Phase 3's VPN forwarding
-path in particular is **unproven on any device** — see § Phase 3
-honest limits.
+path and Phase 4's two-device pairing are both **unproven on real
+devices** — see § Phase 3 honest limits and § Phase 4 honest limits.
 
 ## The one design rule
 
@@ -95,10 +95,12 @@ Do not promise an iPhone version of this dashboard.
 
 ### Privacy
 
-- No `INTERNET` permission on Android (deliberately absent from the
-  manifest). No server, no account, no sync in Phases 1–2.
-- Phase 4's cross-device view, if ever built, is local-LAN only — never
-  a cloud dashboard of the user's traffic.
+- Phases 1–3 had no `INTERNET` permission on Android (deliberately
+  absent from the manifest). Phase 4 adds it LAN-only — see the
+  flagged Phase 4 decision. No server, no account, no cloud sync in
+  any phase.
+- Phase 4's cross-device view is local-LAN only — never a cloud
+  dashboard of the user's traffic.
 
 ## Phase 1 — This scaffold (done, local)
 
@@ -359,13 +361,140 @@ per-app rate, because `NetworkStatsManager` windows are too coarse.
   service declaration used by the background sampler, adjusted from
   the actual error.
 
-## Phase 4 — Optional cross-device view (only if asked for)
+## Phase 4 — Optional cross-device view (BUILT, local only)
 
-- Phone and laptop each keep measuring themselves. An optional
-  local-LAN pairing (QR code, encrypted, same Wi-Fi) lets one dashboard
-  show both devices' totals side by side.
-- No cloud account, no traffic content, no browsing history — totals
-  and per-app bytes only, and only while both devices opt in.
+Dennis approved this phase after Phase 3 was pushed. It does NOT
+change how either device measures itself: phone and laptop keep
+measuring themselves exactly as before. It only adds an optional
+view of the other device's totals, on the same trusted LAN.
+
+### What was built
+
+- **Devices tab** (`lib/main.dart`, `lib/src/devices.dart`): a third
+  tab next to Live and History. This device's own label (generic by
+  default — "Android phone" / "Windows laptop" — user-editable, never
+  a personal identifier or hostname), a Host section, a Join section,
+  and one card per paired remote device with live rate, device
+  totals, today-recorded total from that device, and its top 5 apps.
+  With nothing paired, the tab explains pairing and offers Host /
+  Join — it never looks broken, and remote totals are never written
+  into this device's history (remote snapshots carry
+  `source == 'remote'` and are display-only).
+- **Host** (`LanHostServer`, `dart:io` `HttpServer`): binds to a LAN
+  IPv4 address only (private ranges preferred; no LAN address means
+  hosting fails visibly, never a loopback server pretending to be
+  reachable). Exactly two endpoints, nothing else: POST `/pair`
+  and GET `/snapshot`. Hosting runs only while the app stays open
+  on the Devices tab. The host's live snapshot comes from the same
+  local collector as the Live tab; its today total comes from its
+  own history store (recorded totals only, or omitted when
+  unavailable).
+- **Pairing, both sides must opt in**: the host shows a QR code
+  (`qr_flutter`, display only) and a copyable pairing code
+  `MYMY|v1|<host>|<port>|<pin>|<label>`, plus a 6-digit PIN. The PIN
+  is generated with `Random.secure`, expires after 2 minutes, is
+  single-use, and locks after 5 failed attempts (one 403 status
+  covers wrong / expired / used / locked, so there is no PIN
+  oracle). The QR code and pairing code contain NO bearer token —
+  a photographed code alone never grants access. On PIN acceptance
+  the host issues a random 256-bit bearer token (43 base64url
+  chars) to that guest over the LAN; the guest stores it in
+  app-private preferences. Guest entry is manual by design: paste
+  the full pairing code, or enter host + port + PIN. There is NO
+  camera scan in Phase 4 — a scanner plugin would add a native
+  surface and a CAMERA permission for a flow that manual entry
+  covers fully, including on Windows, which has no camera
+  assumption. Pasting the code is the QR equivalent on the guest
+  side.
+- **Guest polling**: remote snapshots are polled every 5 seconds
+  while the Devices tab is open (not in the background). Rates use
+  the shared `UsageService.calculate` maths over successive remote
+  snapshots (both timestamps come from the host, so guest clock
+  skew cannot invent a rate). A device that has not answered
+  within 15 seconds is Stale: rates forced to 0 with its last-seen
+  time, never a frozen rate presented as live. A device that has
+  never answered is Offline. A 401 from the host means the pairing
+  was revoked — the UI says so and the guest must re-pair.
+- **Revocation, either side, any time**: host "Stop hosting &
+  revoke" stops the server AND regenerates the bearer token, so
+  every previously issued guest token stops working at once.
+  Guest "Forget" removes the device and stops polling it. A
+  restarted host requires fresh pairing; old guests do not
+  silently reconnect.
+- **Payload allowlist** (`RemoteDeviceSnapshot.toShareJson`):
+  device label, timestamps, totals, mobile split, today-recorded
+  totals, and per-app id/name/rx/tx only. Connections are dropped
+  before sending even when the local snapshot has them, and any
+  `connections` key in an incoming payload is ignored on parse.
+  What is NEVER shared, by construction: traffic content, URLs,
+  hostnames, DNS names, browsing history, or connection remotes.
+
+### INTERNET permission — the flagged Phase 4 decision
+
+Phases 1–3 deliberately had **no** `INTERNET` permission. Phase 4
+ADDS it, LAN-only, with a written justification in
+`AndroidManifest.xml` (and here, and in the README):
+
+> Android requires `INTERNET` for an app to open sockets at all,
+> including a LAN-only `HttpServer`/`HttpClient` pair between the
+> user's own devices. In MyMy it is used ONLY for the Devices
+> tab's LAN host (bound to a LAN address) and guest client, talking
+> only to a paired device on the same trusted Wi-Fi, token-gated,
+> totals + per-app bytes only. It is NOT used to contact any remote
+> server, and no usage data is ever sent to the internet. If Phase 4
+> is ever removed, this permission must be removed with it.
+
+Two things this does NOT do: it does not prove or change the
+Phase 3 question of whether protected VPN relay sockets need
+`INTERNET` on a real phone (that device test still stands on its
+own), and it does not make Phase 4 encrypted — see the next
+section.
+
+### Phase 4 honest limits (read before claiming anything)
+
+- **No TLS, stated plainly.** Phase 4 security is LAN + bearer
+  token ONLY. There is no TLS layer, no certificate pinning, and no
+  end-to-end encryption claim anywhere in code or docs. A bearer
+  token sent over plain HTTP on a LAN can be observed by anyone
+  else on that LAN. **Do not pair on untrusted or public Wi-Fi.**
+  A self-signed TLS layer with fingerprint checking was
+  considered and NOT shipped blind: its certificate handling cannot
+  be verified without two real devices, and a wrong TLS layer
+  would be worse than an honest LAN + token statement.
+- **Token storage is not encrypted at rest.** The guest token
+  lives in app-private SharedPreferences. That is acceptable only
+  because the token is LAN-scoped and revocable (host
+  regenerates it) — it is never a cloud credential, and a leaked
+  token alone grants only totals + per-app bytes from that host,
+  while it is hosting, on that LAN.
+- **Nothing about real two-device pairing is proven.** The host
+  server, PIN exchange, token fetch, and sanitised payload are
+  proven at Dart level over loopback in `test/devices_test.dart`
+  (pair once, 401 without a token, 403 on a reused PIN, payload
+  allowlist). They have NEVER run between a real phone and a real
+  laptop: LAN discovery on real Wi-Fi, Windows Firewall prompts
+  for the local server, QR display on a real phone screen, manual
+  entry on Windows, token/PIN behaviour on a real network, and
+  guest clock / host clock behaviour are all unproven. **Do not
+  claim cross-device view works until two real devices prove it.**
+- **Windows Firewall is an expected first-run hurdle.** The first
+  time the Windows host starts, Windows Firewall will almost
+  certainly prompt to allow MyMy on private networks. Allowing it
+  on private networks only (not public) is the correct answer;
+  declining it means guests cannot reach the host, and the guest
+  will show Offline — that is the honest signal, not a bug.
+- **Remote "today" is the remote device's recorded total**, from
+  its own history store while it was sampling. It is not a full OS
+  day total, and it is not this device's history. If the remote
+  device has no history to report, the card shows "—" for today
+  instead of inventing a number.
+- **Hosting stops when the app closes.** There is no background
+  LAN server in Phase 4. A guest polling a closed host correctly
+  shows Stale, then Offline.
+- **No remote history sync, no remote control.** The guest sees
+  live totals + top apps + today-recorded totals only. It cannot
+  read the remote device's full history, change its settings, or
+  start/stop anything on it. Pairing is view-only, by design.
 
 ## Permissions the user must grant
 
@@ -376,6 +505,8 @@ per-app rate, because `NetworkStatsManager` windows are too coarse.
 | Android (Phase 3) | In-app VPN disclosure | Accept in the disclosure dialog on the Live tab | VPN mode cannot start (Polling stays) |
 | Android (Phase 3) | System VPN consent | Android VPN dialog → OK | `'denied'`; mode stays Polling with an error message |
 | Android (Phase 3) | `BIND_VPN_SERVICE` (manifest) | Granted to the app's own service at install | VPN service cannot be bound |
+| Android (Phase 4) | `INTERNET` (manifest, LAN-only) | Granted at install | Devices tab cannot host or join; everything else works as before |
+| Android + Windows (Phase 4) | Pairing opt-in on both sides | Host shows PIN + code; guest pastes code or enters host/port/PIN | No remote device is shown; no data is shared |
 | Windows (Phase 2) | Run as administrator (for EStats) | Right-click → Run as administrator | TCP per-process bytes unavailable; ETW-only view |
 | Windows (Phase 2) | — | — | UDP per-process bytes need ETW regardless |
 
@@ -456,6 +587,38 @@ and claim the mode works.
     disclosure text against Play's VPNService policy and confirm it
     still matches what the service actually does.
 
+### Two devices (Phase 4 — phone + laptop, real hardware)
+Run these only after the Actions APK + Windows builds are green and
+installed. Do them on a trusted home Wi-Fi only — Phase 4 has no TLS
+(LAN + token only), so never test pairing on public Wi-Fi.
+1. Phone hosts, laptop joins: phone Devices tab → Host this device
+   → QR + PIN shown; laptop Devices tab → Join a device → paste the
+   pairing code (or enter host + port + PIN). Within ~5 seconds the
+   laptop card must show the phone's totals + top apps, with a live
+   rate that rises when the phone streams.
+2. Reverse: laptop hosts, phone joins. Windows Firewall will prompt
+   on the laptop — allow on **private** networks only, not public.
+   Declining must show the guest as Offline, not crash.
+3. PIN rules on a real network: a PIN older than 2 minutes must fail;
+   a used PIN must fail on second use; 5 wrong PINs must lock the
+   PIN. The guest must see a plain failure, never a partial pairing.
+4. Revoke both ways: host "Stop hosting & revoke" must make the guest
+   show revoked/Offline; guest "Forget" must remove the card and stop
+   polling. A restarted host must require fresh pairing.
+5. Stale signal: close the host app mid-view — the guest card must go
+   Stale (rates zeroed, last-seen shown), never a frozen rate
+   presented as live, and never zeros presented as usage.
+6. No mixing: remote totals must NOT appear in the guest's History
+   tab, and must NOT change its budget or today total.
+7. Never-shared check: no screen anywhere may show a remote device's
+   URLs, hosts, DNS, browsing history, or connections — totals +
+   per-app bytes only.
+8. Rename: changing a device's label updates only that side's display
+   (restart hosting for guests to see a host's new label).
+9. QR check: the host QR code displays on a real phone screen. It is
+   display-only; the guest pastes the code or enters host/port/PIN
+   manually — there is no camera scan to test.
+
 ### Android phone (Phase 2 additions)
 1. Turn on "Sample in background" on the History tab, close the app,
    use another app for a few minutes, reopen MyMy, and tap Merge now
@@ -508,7 +671,7 @@ and claim the mode works.
 ## File map
 
 ```
-lib/main.dart                          Live + History tabs, budget banner
+lib/main.dart                          Live + History + Devices tabs, budget banner
 lib/src/models.dart                    Counter contract (cumulative only)
 lib/src/format.dart                    Decimal MB / rate formatting
 lib/src/usage_service.dart             Channel source + rate maths +
@@ -518,6 +681,8 @@ lib/src/budget.dart                    Daily cap checker + local store
 lib/src/background.dart                Background-sample merge controller
 lib/src/vpn.dart                       VPN mode state, disclosure store,
                                        reconciliation, VPN polling service
+lib/src/devices.dart                   LAN host server, pairing payload,
+                                       PIN + token, guest poller, store
 windows/runner/mymy_usage.h/.cpp       Windows collector (IP Helper + EStats)
 android/.../MainActivity.kt            mymy/usage channel (Android engine +
                                        VPN consent flow, request code 1001)
@@ -526,12 +691,14 @@ android/.../BackgroundSamplingService.kt  Foreground service, 1 sample/min
 android/.../VpnLiveService.kt          VPN service: TUN loop, TCP/UDP proxy,
                                        attribution, counters, teardown
 android/.../VpnPacket.kt               IPv4/TCP/UDP parse + build, checksums
-android/.../AndroidManifest.xml        Permissions (no INTERNET, on purpose;
+android/.../AndroidManifest.xml        Permissions (INTERNET LAN-only, Phase 4;
                                        BIND_VPN_SERVICE + special-use FGS)
 test/usage_service_test.dart           Rate/format/parsing tests
 test/history_test.dart                 History, merge, budget, Windows JSON
 test/vpn_test.dart                     Mode defaults, disclosure, reconciliation,
                                        VPN snapshot JSON, source separation
+test/devices_test.dart                 Payload allowlist, PIN/token rules,
+                                       rates, stale/offline, host loopback
 test/widget_test.dart                  Dashboard smoke test (fake source)
 .github/workflows/build-apk.yml        CI: analyze + test + release APK
 .github/workflows/build-windows.yml    CI: analyze + test + Windows release
