@@ -1,0 +1,37 @@
+# MyMy Android APK — analyze + test gate, then a debug-key-signed release
+# APK uploaded as an artifact (installable without a release keystore).
+# Pinned to Flutter 3.47.6, the SDK version verified locally.
+name: Build APK
+
+# MANUAL-ONLY (Dennis, 2026-11-02): no push trigger — run from Actions > Run workflow.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: mymy-build-apk
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.6"
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      # Snapshot pushes do not preserve the gradlew executable bit.
+      - run: chmod +x android/gradlew
+      - run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mymy-app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
