@@ -37,6 +37,7 @@ class DailyTotal {
     required this.txBytes,
     required this.mobileRxBytes,
     required this.mobileTxBytes,
+    this.source = 'polling',
   });
 
   final String date;
@@ -44,6 +45,11 @@ class DailyTotal {
   final int txBytes;
   final int mobileRxBytes;
   final int mobileTxBytes;
+
+  /// 'polling', 'vpn', or 'mixed' (both sources recorded that day).
+  /// A day fed by only one source is never silently presented as if
+  /// it came from the other.
+  final String source;
 
   int get totalBytes => rxBytes + txBytes;
   static const empty = DailyTotal(
@@ -62,6 +68,7 @@ class AppDaily {
     required this.appName,
     required this.rxBytes,
     required this.txBytes,
+    this.source = 'polling',
   });
 
   final String date;
@@ -69,6 +76,9 @@ class AppDaily {
   final String appName;
   final int rxBytes;
   final int txBytes;
+
+  /// Same 'polling' / 'vpn' / 'mixed' meaning as [DailyTotal.source].
+  final String source;
 
   int get totalBytes => rxBytes + txBytes;
 }
@@ -169,7 +179,12 @@ abstract class HistoryStore {
 class InMemoryHistoryStore implements HistoryStore {
   final Map<String, DailyTotal> _daily = {};
   final Map<String, Map<String, AppDaily>> _appDaily = {};
-  UsageSnapshot? _last;
+
+  /// One baseline per source ('polling' vs 'vpn'). Switching modes
+  /// must never turn the other mode's counters into a delta: the
+  /// first sample of a mode is its baseline, exactly like the first
+  /// sample of a day.
+  final Map<String, UsageSnapshot> _lastBySource = {};
   DateTime? _lastRecordedAt;
 
   @override
@@ -192,7 +207,8 @@ class InMemoryHistoryStore implements HistoryStore {
     final ordered = [...samples]
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
     for (final sample in ordered) {
-      if (_last != null && !sample.timestamp.isAfter(_last!.timestamp)) {
+      final last = _lastBySource[sample.source];
+      if (last != null && !sample.timestamp.isAfter(last.timestamp)) {
         continue;
       }
       _apply(sample);
@@ -200,8 +216,8 @@ class InMemoryHistoryStore implements HistoryStore {
   }
 
   void _apply(UsageSnapshot snapshot) {
-    final previous = _last;
-    _last = snapshot;
+    final previous = _lastBySource[snapshot.source];
+    _lastBySource[snapshot.source] = snapshot;
     if (previous == null) return;
     final d = computeDelta(previous, snapshot);
     final key = dateKey(snapshot.timestamp);
@@ -220,6 +236,9 @@ class InMemoryHistoryStore implements HistoryStore {
           : (old?.mobileTxBytes ?? -1) < 0
               ? d.mobileTx!
               : (old!.mobileTxBytes + d.mobileTx!),
+      source: old == null
+          ? snapshot.source
+          : (old.source == snapshot.source ? old.source : 'mixed'),
     );
     final perApp = _appDaily.putIfAbsent(key, () => {});
     for (final app in d.appDeltas) {
@@ -230,6 +249,11 @@ class InMemoryHistoryStore implements HistoryStore {
         appName: app.appName,
         rxBytes: (oldApp?.rxBytes ?? 0) + app.rxBytes,
         txBytes: (oldApp?.txBytes ?? 0) + app.txBytes,
+        source: oldApp == null
+            ? snapshot.source
+            : (oldApp.source == snapshot.source
+                ? oldApp.source
+                : 'mixed'),
       );
     }
   }
@@ -241,6 +265,7 @@ class InMemoryHistoryStore implements HistoryStore {
     final yesterdayKey = dateKey(now.subtract(const Duration(days: 1)));
     DailyTotal totalFor(List<String> keys) {
       var rx = 0, tx = 0, mrx = -1, mtx = -1;
+      String? source;
       for (final key in keys) {
         final d = _daily[key];
         if (d == null) continue;
@@ -248,6 +273,9 @@ class InMemoryHistoryStore implements HistoryStore {
         tx += d.txBytes;
         if (d.mobileRxBytes >= 0) mrx = (mrx < 0 ? 0 : mrx) + d.mobileRxBytes;
         if (d.mobileTxBytes >= 0) mtx = (mtx < 0 ? 0 : mtx) + d.mobileTxBytes;
+        source = source == null
+            ? d.source
+            : (source == d.source ? source : 'mixed');
       }
       return DailyTotal(
         date: keys.first,
@@ -255,6 +283,7 @@ class InMemoryHistoryStore implements HistoryStore {
         txBytes: tx,
         mobileRxBytes: mrx,
         mobileTxBytes: mtx,
+        source: source ?? 'polling',
       );
     }
 
@@ -294,10 +323,10 @@ class InMemoryHistoryStore implements HistoryStore {
 /// Any open failure is caught by [open] and reported as an in-memory
 /// fallback — never a crash on the dashboard.
 class SqliteHistoryStore implements HistoryStore {
-  SqliteHistoryStore._(this._db, this._last);
+  SqliteHistoryStore._(this._db, this._lastBySource);
 
   final dynamic _db;
-  UsageSnapshot? _last;
+  final Map<String, UsageSnapshot> _lastBySource;
   DateTime? _lastRecordedAt;
 
   @override
@@ -308,39 +337,71 @@ class SqliteHistoryStore implements HistoryStore {
       final dir = await getApplicationDocumentsDirectory();
       final path = p.join(dir.path, 'mymy_history.db');
       dynamic db;
+      Future<void> onUpgradeFn(dynamic db, int oldV, int newV) async {
+        if (oldV < 2) {
+          // Phase 3: record which source fed each day/app row.
+          await db.execute(
+            "ALTER TABLE daily_totals ADD COLUMN source TEXT "
+            "NOT NULL DEFAULT 'polling'",
+          );
+          await db.execute(
+            "ALTER TABLE app_daily ADD COLUMN source TEXT "
+            "NOT NULL DEFAULT 'polling'",
+          );
+        }
+      }
+
       if (Platform.isWindows || Platform.isLinux) {
         sqfliteFfiInit();
         db = await databaseFactoryFfi.openDatabase(
           path,
           options: OpenDatabaseOptions(
-            version: 1,
+            version: 2,
             onCreate: (db, version) async => _createSchema(db),
+            onUpgrade: onUpgradeFn,
           ),
         );
       } else {
         db = await sqflite.openDatabase(
           path,
-          version: 1,
+          version: 2,
           onCreate: (db, version) async => _createSchema(db),
+          onUpgrade: onUpgradeFn,
         );
       }
-      UsageSnapshot? last;
-      final rows = await db.query(
-        'meta',
-        where: 'key = ?',
-        whereArgs: ['last_snapshot'],
-        limit: 1,
-      );
-      if (rows.isNotEmpty) {
-        try {
-          final json =
-              jsonDecode(rows.first['value'] as String) as Map<String, dynamic>;
-          last = UsageSnapshot.fromJson(json);
-        } catch (_) {
-          last = null;
+      final lastBySource = <String, UsageSnapshot>{};
+      for (final source in ['polling', 'vpn']) {
+        final rows = await db.query(
+          'meta',
+          where: 'key = ?',
+          whereArgs: ['last_snapshot_$source'],
+          limit: 1,
+        );
+        if (rows.isNotEmpty) {
+          try {
+            final json = jsonDecode(rows.first['value'] as String)
+                as Map<String, dynamic>;
+            lastBySource[source] = UsageSnapshot.fromJson(json);
+          } catch (_) {}
         }
       }
-      return SqliteHistoryStore._(db, last);
+      // Legacy Phase 2 key is the polling baseline.
+      if (!lastBySource.containsKey('polling')) {
+        final rows = await db.query(
+          'meta',
+          where: 'key = ?',
+          whereArgs: ['last_snapshot'],
+          limit: 1,
+        );
+        if (rows.isNotEmpty) {
+          try {
+            final json = jsonDecode(rows.first['value'] as String)
+                as Map<String, dynamic>;
+            lastBySource['polling'] = UsageSnapshot.fromJson(json);
+          } catch (_) {}
+        }
+      }
+      return SqliteHistoryStore._(db, lastBySource);
     } catch (_) {
       return InMemoryHistoryStore();
     }
@@ -351,12 +412,14 @@ class SqliteHistoryStore implements HistoryStore {
       'CREATE TABLE daily_totals('
       'date TEXT PRIMARY KEY, total_rx INTEGER NOT NULL, '
       'total_tx INTEGER NOT NULL, mobile_rx INTEGER NOT NULL, '
-      'mobile_tx INTEGER NOT NULL)',
+      'mobile_tx INTEGER NOT NULL, source TEXT NOT NULL '
+      "DEFAULT 'polling')",
     );
     await db.execute(
       'CREATE TABLE app_daily('
       'date TEXT NOT NULL, app_id TEXT NOT NULL, app_name TEXT NOT NULL, '
-      'rx INTEGER NOT NULL, tx INTEGER NOT NULL, '
+      'rx INTEGER NOT NULL, tx INTEGER NOT NULL, source TEXT NOT NULL '
+      "DEFAULT 'polling', "
       'PRIMARY KEY(date, app_id))',
     );
     await db.execute(
@@ -381,7 +444,8 @@ class SqliteHistoryStore implements HistoryStore {
     final ordered = [...samples]
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
     for (final sample in ordered) {
-      if (_last != null && !sample.timestamp.isAfter(_last!.timestamp)) {
+      final last = _lastBySource[sample.source];
+      if (last != null && !sample.timestamp.isAfter(last.timestamp)) {
         continue;
       }
       await _apply(sample);
@@ -389,12 +453,12 @@ class SqliteHistoryStore implements HistoryStore {
   }
 
   Future<void> _apply(UsageSnapshot snapshot) async {
-    final previous = _last;
-    _last = snapshot;
+    final previous = _lastBySource[snapshot.source];
+    _lastBySource[snapshot.source] = snapshot;
     await _db.insert(
       'meta',
       {
-        'key': 'last_snapshot',
+        'key': 'last_snapshot_${snapshot.source}',
         'value': jsonEncode(_snapshotToJson(snapshot)),
       },
       conflictAlgorithm: sqflite.ConflictAlgorithm.replace,
@@ -412,6 +476,8 @@ class SqliteHistoryStore implements HistoryStore {
     final oldTx = existing.isEmpty ? 0 : existing.first['total_tx'] as int;
     final oldMrx = existing.isEmpty ? -1 : existing.first['mobile_rx'] as int;
     final oldMtx = existing.isEmpty ? -1 : existing.first['mobile_tx'] as int;
+    final oldSource =
+        existing.isEmpty ? null : existing.first['source'] as String?;
     await _db.insert(
       'daily_totals',
       {
@@ -424,6 +490,9 @@ class SqliteHistoryStore implements HistoryStore {
         'mobile_tx': d.mobileTx == null
             ? oldMtx
             : (oldMtx < 0 ? d.mobileTx! : oldMtx + d.mobileTx!),
+        'source': oldSource == null
+            ? snapshot.source
+            : (oldSource == snapshot.source ? oldSource : 'mixed'),
       },
       conflictAlgorithm: sqflite.ConflictAlgorithm.replace,
     );
@@ -436,6 +505,8 @@ class SqliteHistoryStore implements HistoryStore {
       );
       final oldAppRx = rows.isEmpty ? 0 : rows.first['rx'] as int;
       final oldAppTx = rows.isEmpty ? 0 : rows.first['tx'] as int;
+      final oldAppSource =
+          rows.isEmpty ? null : rows.first['source'] as String?;
       await _db.insert(
         'app_daily',
         {
@@ -444,6 +515,11 @@ class SqliteHistoryStore implements HistoryStore {
           'app_name': app.appName,
           'rx': oldAppRx + app.rxBytes,
           'tx': oldAppTx + app.txBytes,
+          'source': oldAppSource == null
+              ? snapshot.source
+              : (oldAppSource == snapshot.source
+                  ? oldAppSource
+                  : 'mixed'),
         },
         conflictAlgorithm: sqflite.ConflictAlgorithm.replace,
       );
@@ -457,6 +533,7 @@ class SqliteHistoryStore implements HistoryStore {
     final yesterdayKey = dateKey(now.subtract(const Duration(days: 1)));
     Future<DailyTotal> totalFor(List<String> keys) async {
       var rx = 0, tx = 0, mrx = -1, mtx = -1;
+      String? source;
       for (final key in keys) {
         final rows = await _db.query(
           'daily_totals',
@@ -471,6 +548,12 @@ class SqliteHistoryStore implements HistoryStore {
         final t = rows.first['mobile_tx'] as int;
         if (r >= 0) mrx = (mrx < 0 ? 0 : mrx) + r;
         if (t >= 0) mtx = (mtx < 0 ? 0 : mtx) + t;
+        final rowSource = rows.first['source'] as String?;
+        if (rowSource != null) {
+          source = source == null
+              ? rowSource
+              : (source == rowSource ? source : 'mixed');
+        }
       }
       return DailyTotal(
         date: keys.first,
@@ -478,6 +561,7 @@ class SqliteHistoryStore implements HistoryStore {
         txBytes: tx,
         mobileRxBytes: mrx,
         mobileTxBytes: mtx,
+        source: source ?? 'polling',
       );
     }
 
@@ -502,6 +586,7 @@ class SqliteHistoryStore implements HistoryStore {
               appName: r['app_name'] as String,
               rxBytes: r['rx'] as int,
               txBytes: r['tx'] as int,
+              source: r['source'] as String? ?? 'polling',
             ),
           )
           .toList(),
@@ -522,6 +607,7 @@ Map<String, dynamic> _snapshotToJson(UsageSnapshot s) => {
       'totalTx': s.totalTxBytes,
       'mobileRx': s.mobileRxBytes,
       'mobileTx': s.mobileTxBytes,
+      'source': s.source,
       'apps': [
         for (final a in s.apps)
           {'id': a.id, 'name': a.name, 'rx': a.rxBytes, 'tx': a.txBytes},

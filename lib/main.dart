@@ -8,6 +8,7 @@ import 'src/format.dart';
 import 'src/history.dart';
 import 'src/models.dart';
 import 'src/usage_service.dart';
+import 'src/vpn.dart';
 
 void main() {
   runApp(const MyApp());
@@ -45,6 +46,7 @@ class DashboardPage extends StatefulWidget {
     this.service,
     this.historyStore,
     this.backgroundSource,
+    this.vpnSource,
   });
 
   final UsageService? service;
@@ -54,15 +56,21 @@ class DashboardPage extends StatefulWidget {
   final HistoryStore? historyStore;
   final BackgroundSamplingSource? backgroundSource;
 
+  /// Injected in tests; otherwise derived from the channel source
+  /// (Android only — the method channel implements it there).
+  final VpnLiveSource? vpnSource;
+
   @override
   State<DashboardPage> createState() => _DashboardPageState();
 }
 
 class _DashboardPageState extends State<DashboardPage> {
-  late final UsageService _service;
+  late UsageService _service;
+  late VpnPollingService _vpnPolling;
   HistoryStore? _history;
   BudgetStore? _budgetStore;
   BackgroundSamplingSource? _backgroundSource;
+  VpnLiveSource? _vpnSource;
   UsageStatus? _status;
   LiveUsage? _live;
   UsageSnapshot? _lastSnapshot;
@@ -75,6 +83,22 @@ class _DashboardPageState extends State<DashboardPage> {
   bool _mergedOnce = false;
   int _mergedCount = 0;
 
+  // Phase 3 VPN live mode. The mode always starts as polling; VPN is
+  // only entered through the disclosure + system consent flow below.
+  final VpnLiveState _vpnState = VpnLiveState();
+  VpnDisclosureStore? _disclosureStore;
+  UsageSnapshot? _vpnBaseline;
+  ReconciliationResult? _reconciliation;
+  int _pollsSinceReconciliation = 0;
+  String _vpnError = '';
+
+  bool get _vpnControlsVisible {
+    // Production: Android only (network-stats engine). Tests: an
+    // injected vpnSource forces the controls visible regardless.
+    if (widget.vpnSource != null) return true;
+    return _status?.engine == 'network-stats' && _vpnSource != null;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -85,6 +109,13 @@ class _DashboardPageState extends State<DashboardPage> {
       background = source as BackgroundSamplingSource;
     }
     _backgroundSource = background;
+    _vpnSource = widget.vpnSource ??
+        (source is VpnLiveSource ? source as VpnLiveSource : null);
+    _vpnPolling = VpnPollingService(
+      _vpnSource ?? _NoopVpnLiveSource(),
+    );
+    _loadDisclosure();
+    _checkRestoredVpn();
     if (widget.historyStore != null) {
       _history = widget.historyStore;
     } else {
@@ -96,6 +127,47 @@ class _DashboardPageState extends State<DashboardPage> {
     }
     _loadBudget();
     _refreshStatusAndStart();
+  }
+
+  Future<void> _loadDisclosure() async {
+    try {
+      final store = await VpnDisclosureStore.load();
+      if (!mounted) return;
+      setState(() {
+        _disclosureStore = store;
+        _vpnState.disclosureAccepted = store.accepted;
+      });
+    } catch (_) {
+      // Disclosure state unavailable here (e.g. in tests); VPN mode
+      // simply stays off, which is the safe default.
+    }
+  }
+
+  /// If the VPN service is already running when the app reopens (the
+  /// user started it earlier and never stopped it), restore the badge
+  /// and VPN polling — but reconciliation stays unavailable, because
+  /// the system baseline from the original start is gone.
+  Future<void> _checkRestoredVpn() async {
+    final vpnSource = _vpnSource;
+    if (vpnSource == null) return;
+    try {
+      final active = await vpnSource.isVpnLive();
+      if (!active || !mounted) return;
+      setState(() {
+        _vpnState.markStarted(
+          DateTime.now().millisecondsSinceEpoch,
+        );
+        _reconciliation = const ReconciliationResult(
+          status: 'unavailable',
+          vpnTotalBytes: 0,
+          systemDeltaBytes: 0,
+          differenceBytes: 0,
+          message: 'Reconciliation unavailable: VPN mode was already '
+              'running when the app reopened, so no system baseline '
+              'exists for this session.',
+        );
+      });
+    } catch (_) {}
   }
 
   Future<void> _loadBudget() async {
@@ -162,15 +234,24 @@ class _DashboardPageState extends State<DashboardPage> {
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 1), (_) async {
       try {
-        final live = await _service.poll();
+        final live = _vpnState.mode == LiveMode.vpn
+            ? await _vpnPolling.poll()
+            : await _service.poll();
         if (!mounted) return;
         _lastSnapshot = live.snapshot;
+        // History records only the active mode's snapshots. The
+        // store keeps a separate baseline per source, so a mode
+        // switch never invents a delta — but recording both modes
+        // at once would double-count, so only the active one records.
         await _history?.record(live.snapshot);
         setState(() {
           _live = live;
           _error = null;
         });
         await _refreshBudgetCheck(live.snapshot);
+        if (_vpnState.mode == LiveMode.vpn) {
+          await _maybeReconcile();
+        }
       } catch (e) {
         _timer?.cancel();
         _polling = false;
@@ -178,6 +259,34 @@ class _DashboardPageState extends State<DashboardPage> {
         setState(() => _error = e.toString());
       }
     });
+  }
+
+  /// Reconciliation, at most once every 30 polls while VPN mode is
+  /// active: compare VPN cumulative totals against the system delta
+  /// since the baseline captured at VPN start.
+  Future<void> _maybeReconcile() async {
+    _pollsSinceReconciliation++;
+    if (_pollsSinceReconciliation < 30) return;
+    _pollsSinceReconciliation = 0;
+    final vpnSource = _vpnSource;
+    final baseline = _vpnBaseline;
+    final latest = _lastSnapshot;
+    if (vpnSource == null || baseline == null || latest == null) return;
+    try {
+      final now = await _service.source.getSnapshot();
+      if (!mounted) return;
+      setState(() {
+        _reconciliation = Reconciliation.check(
+          vpnRxBytes: latest.totalRxBytes,
+          vpnTxBytes: latest.totalTxBytes,
+          netBaseline: baseline,
+          netNow: now,
+        );
+      });
+    } catch (_) {
+      // Reconciliation is advisory; a failure here must not break
+      // the live dashboard.
+    }
   }
 
   Future<void> _refreshBudgetCheck(UsageSnapshot snapshot) async {
@@ -223,6 +332,117 @@ class _DashboardPageState extends State<DashboardPage> {
       // (e.g. a missing notification permission makes start fail).
       if (ok) _backgroundOn = on;
     });
+  }
+
+  Future<void> _onModeSelected(LiveMode mode) async {
+    if (mode == LiveMode.polling) {
+      await _stopVpn();
+      return;
+    }
+    await _startVpnFlow();
+  }
+
+  /// Disclosure → system consent → service start, in that order.
+  /// Any step failing or being declined leaves the mode as polling.
+  Future<void> _startVpnFlow() async {
+    final vpnSource = _vpnSource;
+    if (vpnSource == null) return;
+    if (!_vpnState.disclosureAccepted) {
+      final accepted = await _showDisclosureDialog();
+      if (!accepted || !mounted) {
+        setState(() => _vpnState.mode = LiveMode.polling);
+        return;
+      }
+      try {
+        await _disclosureStore?.accept();
+      } catch (_) {}
+      setState(() => _vpnState.disclosureAccepted = true);
+    }
+    final prepared = await vpnSource.prepareVpn();
+    if (!mounted) return;
+    if (prepared != 'ready') {
+      setState(() {
+        _vpnError = prepared == 'denied'
+            ? 'VPN consent was declined in the system dialog. '
+                'MyMy stays in polling mode.'
+            : 'Could not prepare VPN mode. MyMy stays in polling mode.';
+        _vpnState.markStopped();
+      });
+      return;
+    }
+    final started = await vpnSource.startVpnLive();
+    if (!mounted) return;
+    if (!started) {
+      final status = await vpnSource.getVpnStatus();
+      setState(() {
+        _vpnError = status.error.isNotEmpty
+            ? status.error
+            : 'VPN live mode could not be started. MyMy stays in '
+                'polling mode.';
+        _vpnState.markStopped();
+      });
+      return;
+    }
+    UsageSnapshot? baseline;
+    try {
+      baseline = await _service.source.getSnapshot();
+    } catch (_) {
+      baseline = null;
+    }
+    if (!mounted) return;
+    // Fresh rate baselines for both modes: the first VPN poll must
+    // not inherit polling counters (or vice versa) as a rate spike.
+    _service = UsageService(source: _service.source);
+    _vpnPolling.reset();
+    setState(() {
+      _vpnState.markStarted(DateTime.now().millisecondsSinceEpoch);
+      _vpnBaseline = baseline;
+      _reconciliation = null;
+      _pollsSinceReconciliation = 0;
+      _vpnError = '';
+      _live = null;
+    });
+  }
+
+  Future<void> _stopVpn() async {
+    final vpnSource = _vpnSource;
+    if (vpnSource != null && _vpnState.vpnActive) {
+      await vpnSource.stopVpnLive();
+    }
+    if (!mounted) return;
+    _service = UsageService(source: _service.source);
+    _vpnPolling.reset();
+    setState(() {
+      _vpnState.markStopped();
+      _reconciliation = null;
+      _vpnBaseline = null;
+      _vpnError = '';
+      _live = null;
+    });
+  }
+
+  Future<bool> _showDisclosureDialog() async {
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('VPN live mode — please read first'),
+        content: const SingleChildScrollView(
+          child: Text(vpnDisclosureText),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Decline'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('I understand, turn on VPN live'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
   }
 
   @override
@@ -276,6 +496,65 @@ class _DashboardPageState extends State<DashboardPage> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (_vpnControlsVisible) ...[
+          SegmentedButton<LiveMode>(
+            segments: const [
+              ButtonSegment(
+                value: LiveMode.polling,
+                label: Text('Polling'),
+                icon: Icon(Icons.timer_outlined),
+              ),
+              ButtonSegment(
+                value: LiveMode.vpn,
+                label: Text('VPN live'),
+                icon: Icon(Icons.vpn_lock_outlined),
+              ),
+            ],
+            selected: {_vpnState.mode},
+            onSelectionChanged: (modes) => _onModeSelected(modes.first),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Polling is the default. VPN live is opt-in, off by '
+            'default, and Android only — it counts bytes as packets '
+            'pass through MyMy on this device. See the disclosure '
+            'before turning it on.',
+          ),
+          const SizedBox(height: 12),
+        ],
+        if (_vpnState.mode == LiveMode.vpn)
+          Card(
+            color: Theme.of(context).colorScheme.primaryContainer,
+            child: const Padding(
+              padding: EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'VPN live — counting on this device only',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Traffic is routed through MyMy on this phone only. '
+                    'No server, no content inspection. Any other VPN '
+                    'is disconnected while this is active. Turn it off '
+                    'above to return to polling mode.',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        if (_vpnError.isNotEmpty)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(_vpnError),
+            ),
+          ),
+        if (_vpnState.mode == LiveMode.vpn &&
+            _reconciliation != null)
+          _ReconciliationCard(result: _reconciliation!),
         if (status.engine == 'network-stats' && !status.hasPermission)
           _PermissionBanner(onOpenSettings: _openSettings),
         if (status.engine == 'windows-ip-helper' && !status.hasPermission)
@@ -577,6 +856,14 @@ class _HistoryTotalsCard extends StatelessWidget {
             _StatRow(
               label: 'Last 7 days (recorded)',
               value: formatBytes(summary.last7Days.totalBytes),
+            ),
+            _StatRow(
+              label: 'Recorded by',
+              value: switch (summary.today.source) {
+                'vpn' => 'VPN live mode',
+                'mixed' => 'Polling + VPN live (mixed day)',
+                _ => 'Polling',
+              },
             ),
             if (summary.biggestUserToday != null)
               _StatRow(
@@ -1104,6 +1391,69 @@ class _Stat extends StatelessWidget {
           style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
         ),
       ],
+    );
+  }
+}
+
+/// No-op VPN source used when the platform channel has no VPN
+/// handler (Windows, tests without injection). Every call degrades
+/// to inactive/error, so VPN mode can never silently claim to run.
+class _NoopVpnLiveSource implements VpnLiveSource {
+  @override
+  Future<String> prepareVpn() async => 'error';
+  @override
+  Future<bool> startVpnLive() async => false;
+  @override
+  Future<bool> stopVpnLive() async => false;
+  @override
+  Future<bool> isVpnLive() async => false;
+  @override
+  Future<VpnStatus> getVpnStatus() async => VpnStatus.inactive;
+  @override
+  Future<UsageSnapshot> getVpnSnapshot() async {
+    throw StateError('VPN live mode is not available on this platform');
+  }
+}
+
+class _ReconciliationCard extends StatelessWidget {
+  const _ReconciliationCard({required this.result});
+
+  final ReconciliationResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final isMismatch = result.status == 'mismatch';
+    return Card(
+      color: isMismatch
+          ? Theme.of(context).colorScheme.errorContainer
+          : null,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              result.status == 'match'
+                  ? 'Reconciled with system totals'
+                  : result.status == 'mismatch'
+                      ? 'VPN totals differ from system totals'
+                      : 'Reconciliation unavailable',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            if (result.status != 'unavailable') ...[
+              Text('VPN counted: ${formatBytes(result.vpnTotalBytes)}'),
+              Text(
+                'System delta this session: '
+                '${formatBytes(result.systemDeltaBytes)}',
+              ),
+              Text('Difference: ${formatBytes(result.differenceBytes)}'),
+              const SizedBox(height: 8),
+            ],
+            Text(result.message),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -5,7 +5,7 @@ internet usage per app in a live dashboard. See
 [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) for the full phased plan,
 including the honest platform limits.
 
-**Phase 2 status (local only, NOT pushed to GitHub):**
+**Phase 3 status (local only, NOT pushed to GitHub):**
 
 - ✅ Android: live dashboard, device totals, mobile vs Wi-Fi split,
   per-app totals for today, live rates from 1-second polling deltas of
@@ -19,6 +19,18 @@ including the honest platform limits.
   sampling), per-app today, biggest user today, daily cap banner.
 - ✅ Android background sampling: foreground service, 1 sample/min,
   merged into history on reopen (never double-counted).
+- ✅ Android VPN live mode (opt-in, off by default): TUN + TCP/UDP
+  proxy service, per-app attribution via
+  `ConnectivityManager.getConnectionOwnerUid`, unmapped bytes shown
+  as "Unattributed" (never guessed), prominent disclosure before
+  start, reconciliation against `NetworkStatsManager` totals with a
+  mismatch warning instead of a silently preferred source, and
+  source-labelled history (polling / VPN / mixed). **NOT proven:**
+  the entire VPN forwarding path needs a real phone — browsing,
+  video, UDP/DNS apps, VPN-conflict behaviour, battery, and the
+  `INTERNET`-permission question (the app still has no `INTERNET`
+  permission; if relay sockets are denied on a real phone, adding it
+  is the first fix to try). Exact device tests are in the plan doc.
 - ❌ iOS: no per-app usage API exists for ordinary App Store apps, so
   iOS is out of scope. See the plan doc.
 
@@ -61,3 +73,8 @@ add those two workflow files via the GitHub web UI instead
   or the service switch will not stay on.
 - **Windows:** run as administrator for per-process TCP byte
   counts. Without it you get adapter totals + connections only.
+- **Android VPN live mode:** Live tab → VPN live → accept the
+  disclosure, then accept Android's VPN consent dialog. Turning it
+  off (Live tab or its notification) returns to polling. While it
+  is active, any other VPN is disconnected — Android allows only
+  one VPN at a time.

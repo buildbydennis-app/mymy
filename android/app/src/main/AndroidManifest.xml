@@ -11,8 +11,28 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Phase 3 VPN live mode: BIND_VPN_SERVICE is the permission that
+         lets the app's VpnService be bound as the device VPN. It is
+         not a data permission: the service counts bytes on-device and
+         sends nothing anywhere.
+         FOREGROUND_SERVICE_SPECIAL_USE is declared only so the VPN
+         service can call startForeground on Android 14+; the service
+         still runs if that call fails, because the system VPN
+         notification shows while the VPN is active. -->
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- Deliberately NO android.permission.INTERNET: this app must not
-         send usage data anywhere. -->
+         send usage data anywhere. Note on the VPN design: relay
+         sockets are created with VpnService.protect() so they bypass
+         the tunnel instead of looping into it; they carry other apps'
+         traffic to its original destination, they are not the app's
+         own network calls, and no usage data is ever transmitted.
+         Whether Android permits those protected relay sockets without
+         INTERNET is the top Phase 3 device-test item — if relay
+         sockets are denied on a real phone, adding INTERNET (with a
+         written justification in the plan) is the first fix to try,
+         and VPN mode must stay visibly failed until then, never
+         silently degraded. -->
     <application
         android:label="mymy"
         android:name="${applicationName}"
@@ -43,6 +63,18 @@
             android:name=".BackgroundSamplingService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".VpnLiveService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn_counting" />
+        </service>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

@@ -63,6 +63,7 @@ class UsageSnapshot {
     required this.mobileTxBytes,
     required this.apps,
     required this.connections,
+    this.source = 'polling',
   });
 
   final DateTime timestamp;
@@ -75,6 +76,12 @@ class UsageSnapshot {
 
   final List<AppUsage> apps;
   final List<LiveConnection> connections;
+
+  /// Where this snapshot came from: 'polling' (NetworkStatsManager /
+  /// Windows collector) or 'vpn' (Android VPN live mode). History keeps
+  /// a separate baseline per source, so switching modes never creates
+  /// a false delta, and a day fed by both sources is labelled 'mixed'.
+  final String source;
 
   int get totalBytes => totalRxBytes + totalTxBytes;
 
@@ -90,6 +97,7 @@ class UsageSnapshot {
       totalTxBytes: (json['totalTx'] as num?)?.toInt() ?? 0,
       mobileRxBytes: (json['mobileRx'] as num?)?.toInt() ?? -1,
       mobileTxBytes: (json['mobileTx'] as num?)?.toInt() ?? -1,
+      source: json['source'] as String? ?? 'polling',
       apps: appsJson
           .whereType<Map>()
           .map((e) => AppUsage.fromJson(Map<String, dynamic>.from(e)))
@@ -120,6 +128,51 @@ class LiveUsage {
 
   /// Per-app live rates, keyed by [AppUsage.id].
   final Map<String, ({double rxPerSecond, double txPerSecond})> appRates;
+}
+
+/// Status reported by the native VPN side (MainActivity /
+/// VpnLiveService). `active` is the only field that may start the VPN
+/// badge; everything else is diagnostic.
+class VpnStatus {
+  const VpnStatus({
+    required this.active,
+    required this.startedAtMs,
+    required this.error,
+    required this.totalRxBytes,
+    required this.totalTxBytes,
+    required this.unattributedRxBytes,
+    required this.unattributedTxBytes,
+  });
+
+  final bool active;
+  final int? startedAtMs;
+  final String error;
+  final int totalRxBytes;
+  final int totalTxBytes;
+  final int unattributedRxBytes;
+  final int unattributedTxBytes;
+
+  static const inactive = VpnStatus(
+    active: false,
+    startedAtMs: null,
+    error: '',
+    totalRxBytes: 0,
+    totalTxBytes: 0,
+    unattributedRxBytes: 0,
+    unattributedTxBytes: 0,
+  );
+
+  factory VpnStatus.fromJson(Map<String, dynamic> json) => VpnStatus(
+        active: json['active'] as bool? ?? false,
+        startedAtMs: (json['startedAtMs'] as num?)?.toInt(),
+        error: json['error'] as String? ?? '',
+        totalRxBytes: (json['totalRx'] as num?)?.toInt() ?? 0,
+        totalTxBytes: (json['totalTx'] as num?)?.toInt() ?? 0,
+        unattributedRxBytes:
+            (json['unattributedRx'] as num?)?.toInt() ?? 0,
+        unattributedTxBytes:
+            (json['unattributedTx'] as num?)?.toInt() ?? 0,
+      );
 }
 
 /// Permission / engine status reported by the native side.

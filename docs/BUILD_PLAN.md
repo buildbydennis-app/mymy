@@ -6,11 +6,13 @@ is using right now and in total. One codebase, one dashboard UI, a
 different native collector per platform. All data stays on the device.
 There is no server, no account, and no data leaves the phone or laptop.
 
-**Status: Phase 2 built locally, NOT pushed to GitHub** (this tree is
+**Status: Phase 3 built locally, NOT pushed to GitHub** (this tree is
 local-only by instruction; workflows are manual-only and pending a
 separate web upload). `flutter analyze` + `flutter test` are the local
 proof so far; a real device / real Windows machine is still required
-before any "it works" claim (see § Testing).
+before any "it works" claim (see § Testing). Phase 3's VPN forwarding
+path in particular is **unproven on any device** — see § Phase 3
+honest limits.
 
 ## The one design rule
 
@@ -207,18 +209,155 @@ only — never a firewall, unless a later phase explicitly asks for it).
    notification is the only notification MyMy posts in Phase 2.
    MyMy never blocks or limits any app — visibility only.
 
-## Phase 3 — Optional opt-in VPNService live mode (Android only)
+## Phase 3 — Opt-in VPNService live mode (Android only) — BUILT locally
 
-Only if Dennis explicitly wants true packet-level live per-app speeds:
+Dennis explicitly approved this phase after the tradeoffs were stated.
+Polling stays the default; VPN live mode is **off by default and
+opt-in only**. It exists to give true packet-level live per-app speeds
+on Android: polling can only show per-app *totals*, never a live
+per-app rate, because `NetworkStatsManager` windows are too coarse.
 
-- A local `VpnService` that routes traffic through the device itself
-  (no server), counting bytes per app as packets pass.
-- Tradeoffs to accept first, not after: **only one VPN can run at a
-  time** (so a real VPN and MyMy live mode cannot coexist), higher
-  battery use, and Google Play requires a prominent disclosure for
-  VPNService use. The polling mode stays the default; VPN mode is
-  opt-in, off by default, and its counts must be reconciled against
-  `NetworkStatsManager` totals in testing.
+### What was built
+
+- **VPN service** (`android/.../VpnLiveService.kt` + `VpnPacket.kt`):
+  a `VpnService` with a TUN interface (private address `10.0.0.2/32`,
+  MTU 1500, route `0.0.0.0/0`, session name "MyMy Live"). Because
+  Android cannot send raw IP packets without root, it uses the
+  standard NetGuard-class design: transport-layer proxying. IPv4
+  packets are parsed, TCP gets a protected `Socket` to the destination
+  with a synthesised SYN-ACK and sequence/ack tracking both ways, UDP
+  gets a protected `DatagramSocket` relay, payloads are relayed
+  opaquely (only headers are read, to route and count — no content
+  inspection, no logging, nothing sent anywhere). MyMy's own package
+  is disallowed from the tunnel so the service never captures itself.
+- **Attribution** (the method that was verified, not guessed):
+  `ConnectivityManager.getConnectionOwnerUid(protocol, local, remote)`
+  — available from API 29, returns the UID for a connection on the
+  calling VPN's tunnel, throws `SecurityException` if the caller is
+  not the active VPN, and returns `INVALID_UID` when a connection is
+  not found. Only `IPPROTO_TCP` and `IPPROTO_UDP` are supported. The
+  service guards the call to API 29+, catches `SecurityException`,
+  and sends every unmapped byte to an explicit **"Unattributed"**
+  bucket in the UI — never to a guessed app.
+- **Counting rule:** tx = IP total length of packets received from
+  TUN (app → internet), rx = IP total length of packets written back
+  to TUN. Headers are included, closest to `NetworkStatsManager`'s
+  IP-layer accounting. Counters are cumulative since VPN start; live
+  rates are still derived in Dart as `(new − old) / elapsed`.
+- **DNS:** the service adds the active network's DNS server (from
+  `LinkProperties`) to the tunnel builder — never a hardcoded
+  third-party resolver. DNS then flows as ordinary UDP port-53 relay.
+  If no DNS server is available, none is added: DNS bypasses the VPN
+  (still works, simply not VPN-counted).
+- **Consent flow** (`MainActivity.kt`, request code 1001):
+  `VpnService.prepare()` returns null when consent is already held
+  (Dart gets `'ready'` at once) or a system dialog Intent otherwise.
+  The pending channel result is held and answered from
+  `onActivityResult` — `'ready'` on approval, `'denied'` on cancel —
+  so Dart never has to guess whether the system dialog was accepted.
+  If `establish()` returns null (another VPN is active), the service
+  surfaces "Could not establish the VPN tunnel. Another VPN may be
+  active." and stops — it never runs silently degraded.
+- **Dart UI + state** (`lib/src/vpn.dart`, `lib/main.dart`): a
+  Polling / VPN live `SegmentedButton` on the Live tab (Polling is
+  the default, always, including on reopen). Switching to VPN live
+  first shows a non-dismissible disclosure dialog with the exact text
+  in `vpnDisclosureText` (device-only routing, no server, bytes per
+  app only, no content inspection, never blocks/limits, disconnects
+  any other VPN, higher battery, off anytime from the Live tab or
+  the notification). Acceptance is persisted in SharedPreferences
+  (`vpn_disclosure_accepted`) and records disclosure only — it does
+  not start the VPN. Only after acceptance AND system consent does
+  the service start. While active the dashboard shows a "VPN live"
+  badge; turning it off (Live tab, notification Stop action, or
+  system revocation via `onRevoke`) returns to polling and clears
+  the VPN rate baseline, so mode switches never create rate spikes
+  (`VpnPollingService` keeps its own previous snapshot).
+- **Reconciliation** (`lib/src/vpn.dart`, testable Dart): at VPN
+  start Dart captures a polling baseline snapshot; at most once
+  every 30 polls it compares the VPN total for that window against
+  the `NetworkStatsManager` delta for the same window. Tolerance =
+  max(1 MB, 25% of the system delta). Result is `match`, `mismatch`
+  (warning card with VPN total, system delta, difference, and the
+  reasons — IPv6 bypass, pre-VPN connections, unattributed bytes),
+  or `unavailable` (no baseline, or a counter reset). Neither source
+  is silently preferred. On reopen with the VPN already running,
+  reconciliation is `unavailable` (no baseline from the original
+  start) — stated, not faked.
+- **History, source-aware** (`lib/src/history.dart`, schema v2):
+  `DailyTotal`/`AppDaily` carry a `source` (`'polling'`, `'vpn'`, or
+  `'mixed'` when both fed that day/row). In-memory and SQLite stores
+  keep one baseline per source, so the first sample of a mode is
+  that mode's baseline and switching modes never invents a delta.
+  Only the active mode's snapshots are recorded — recording both at
+  once would double-count. SQLite v1 databases upgrade by adding
+  `source TEXT NOT NULL DEFAULT 'polling'`; new databases are
+  created at v2. The History tab shows "Recorded by" per day.
+- **Manifest** (`AndroidManifest.xml`): `BIND_VPN_SERVICE` permission
+  + the `VpnService` entry (intent filter `android.net.VpnService`,
+  permission `BIND_VPN_SERVICE`, `exported="false"`,
+  `foregroundServiceType="specialUse"` + special-use subtype
+  property, so `startForeground` is legal on Android 14+).
+  `startForeground` is wrapped in try/catch: if it throws on some OS
+  version, the service still runs and the system VPN notification
+  shows — this is tentative and must be device-tested, not claimed
+  as settled.
+
+### Phase 3 honest limits (read before claiming anything)
+
+- **Nothing about the VPN forwarding path is proven.** The Kotlin
+  service, the packet parser, TCP state handling, UDP relay, DNS
+  relay, attribution on a real device, and the consent flow were all
+  written without an Android SDK or a phone to build or run them
+  against. `flutter analyze` + `flutter test` prove only the Dart
+  side (mode defaults, disclosure persistence, reconciliation maths,
+  VPN snapshot parsing, stop/teardown state, history source
+  separation). The first compile of the Kotlin code is the Actions
+  build; the first behaviour proof is a real phone — see the Phase 3
+  device tests below. **Do not claim VPN live mode works until a
+  real phone proves it.**
+- **IPv6 bypass:** no IPv6 route is added, so IPv6 traffic still
+  works but is not VPN-counted. Reconciliation will show this as a
+  gap on IPv6-heavy traffic, which is the honest signal, not a bug
+  to paper over.
+- **ICMP dropped:** ping does not work while VPN live mode is on
+  (no ICMP forwarding). TCP/UDP only.
+- **TCP out-of-order segments:** dropped (no reordering buffer);
+  TCP retransmission recovers. Retransmitted already-acked data is
+  re-acked, never re-written to the remote socket.
+- **Pre-VPN connections:** connections established before VPN start
+  are not VPN-counted (their packets arrive on sockets the tunnel
+  never saw). Restarting an app after enabling VPN live mode is the
+  honest workaround, and the device test checks this.
+- **UDP attribution is weaker than TCP:** `getConnectionOwnerUid`
+  may return `INVALID_UID` for short-lived UDP flows; those bytes
+  land in "Unattributed". If UDP attribution is mostly unattributed
+  on a real phone, that is a finding to report, not a reason to
+  guess.
+- **INTERNET permission — the top device-test risk:** the app still
+  has **no** `INTERNET` permission, by design. The reasoning: relay
+  sockets are created with `VpnService.protect()` so they bypass
+  the tunnel instead of looping into it; they carry other apps'
+  traffic to its original destination and are not the app's own
+  network calls, and no usage data is ever transmitted. Whether
+  Android permits those protected relay sockets without `INTERNET`
+  is **not proven** — if relay sockets are denied on a real phone
+  (browsing fails in VPN mode, or the service errors), adding
+  `INTERNET` with a written justification here is the first fix to
+  try, and VPN mode must stay visibly failed until then, never
+  silently degraded.
+- **Battery:** relaying every packet through the app costs more
+  battery than polling. The disclosure says so; the device test
+  observes it qualitatively (no number is promised).
+- **Play disclosure:** the in-app disclosure text exists, but Play
+  review of the VPNService declaration has not happened — that is a
+  store-submission step, not a local proof.
+- **Foreground special-use handling** (`specialUse` type + subtype
+  property + try/catch around `startForeground`) is the most
+  tentative manifest choice in this phase; if the Actions build or
+  a real phone rejects it, the fallback is the plain foreground
+  service declaration used by the background sampler, adjusted from
+  the actual error.
 
 ## Phase 4 — Optional cross-device view (only if asked for)
 
@@ -234,6 +373,9 @@ Only if Dennis explicitly wants true packet-level live per-app speeds:
 |---|---|---|---|
 | Android | Usage access | Dashboard banner → Settings → Usage access → MyMy → Allow | Device totals only; per-app list empty |
 | Android (Phase 2) | Notifications + foreground service | System prompts on first background run | Sampling stops when app is closed |
+| Android (Phase 3) | In-app VPN disclosure | Accept in the disclosure dialog on the Live tab | VPN mode cannot start (Polling stays) |
+| Android (Phase 3) | System VPN consent | Android VPN dialog → OK | `'denied'`; mode stays Polling with an error message |
+| Android (Phase 3) | `BIND_VPN_SERVICE` (manifest) | Granted to the app's own service at install | VPN service cannot be bound |
 | Windows (Phase 2) | Run as administrator (for EStats) | Right-click → Run as administrator | TCP per-process bytes unavailable; ETW-only view |
 | Windows (Phase 2) | — | — | UDP per-process bytes need ETW regardless |
 
@@ -266,6 +408,54 @@ Only if Dennis explicitly wants true packet-level live per-app speeds:
    UDP bytes attributed — that is the documented Phase 2 gap, not a
    bug to hide. ETW is still pending for UDP per-process bytes.
 
+### Android phone (Phase 3 — VPN live mode)
+Run these only after the Actions APK build is green. Do them in
+order; stop at the first failure and report it — do not skip ahead
+and claim the mode works.
+1. With no other VPN running, open MyMy → Live tab. Confirm the
+   mode control defaults to Polling (never VPN) on a fresh install
+   and on reopen.
+2. Switch to VPN live. A disclosure dialog must appear first, with
+   the device-only / no-server / bytes-only / disconnects-other-VPN /
+   higher-battery wording. Decline it: mode must stay Polling.
+3. Accept the disclosure, then accept the Android VPN consent
+   dialog. The "VPN live" badge must appear, and the VPN
+   notification must show with a working Stop action.
+4. Browse a website and stream a video for ~30 s in VPN mode. Pages
+   must load normally; the live rate must rise; the per-app list
+   must show the browser / video app climbing. **If browsing fails
+   in VPN mode, that is the INTERNET-permission hypothesis failing
+   (see Phase 3 honest limits) — report it as the first fix to try,
+   do not work around it silently.**
+5. Open a UDP/DNS-heavy app (a game or voice call, and a fresh
+   browser tab so DNS runs inside the tunnel). Confirm the app
+   works, DNS resolves, and its bytes appear — or, honestly, that
+   some of them land in "Unattributed". Record which.
+6. Start an app's download *before* enabling VPN mode, then enable
+   it mid-download: confirm the pre-VPN connection is not
+   VPN-counted, and that restarting the download after enabling
+   counts it.
+7. VPN-conflict behaviour: with a real VPN (any provider) connected,
+   try enabling MyMy VPN live — it must fail visibly (tunnel error),
+   never silently. Then disconnect the real VPN, enable MyMy VPN
+   live, and confirm the real VPN is disconnected while MyMy is
+   active (Android allows one VPN at a time).
+8. Reconciliation: after a few minutes in VPN mode, check the
+   reconciliation card. A match within tolerance is the pass; a
+   mismatch warning is a finding to report with its numbers, not a
+   failure to hide — note whether the gap looks like IPv6 traffic
+   (compare against Settings data usage for the same window).
+9. Stop from the Live tab, then again from the notification action:
+   badge and notification must disappear, mode returns to Polling,
+   and the live rate must not spike on the switch back.
+10. Battery: use the phone normally in VPN mode for an hour and
+    note qualitatively whether battery drain is noticeably higher
+    than polling. No number is promised; a qualitative note is the
+    honest result.
+11. Play disclosure: before any store submission, re-read the
+    disclosure text against Play's VPNService policy and confirm it
+    still matches what the service actually does.
+
 ### Android phone (Phase 2 additions)
 1. Turn on "Sample in background" on the History tab, close the app,
    use another app for a few minutes, reopen MyMy, and tap Merge now
@@ -279,14 +469,19 @@ Only if Dennis explicitly wants true packet-level live per-app speeds:
    there (SQLite), while live totals restart from boot (expected).
 
 ### Honest limits of Phase 2 (read before claiming anything)
-- `flutter analyze` clean + `flutter test` 20/20 pass locally (Linux
+- `flutter analyze` clean + `flutter test` 31/31 pass locally (Linux
   VM). They prove Dart logic (history deltas, throttle, reboot
-  clamping, merge dedupe, budget thresholds, Windows JSON parsing)
-  and the UI shell — **not** the C++ collector (needs MSVC + Flutter
-  Windows headers, absent here) and **not** the Kotlin service (needs
-  an Android SDK + phone, absent here). GitHub Actions (manual-only
-  workflows) is the first real compile for both, and a real laptop /
-  phone is the first real behaviour proof.
+  clamping, merge dedupe, budget thresholds, Windows JSON parsing,
+  plus Phase 3 mode defaults, disclosure persistence, reconciliation
+  maths, VPN snapshot parsing, stop/teardown state, and history
+  source separation) and the UI shell — **not** the C++ collector
+  (needs MSVC + Flutter Windows headers, absent here) and **not**
+  the Kotlin services (needs an Android SDK + phone, absent here).
+  GitHub Actions (manual-only workflows) is the first real compile
+  for both, and a real laptop / phone is the first real behaviour
+  proof. Phase 3's VPN forwarding path is additionally unproven even
+  in code review terms beyond the documented APIs — see § Phase 3
+  honest limits.
 - The C++ EStats signatures, `TCP_ESTATS_DATA_RD_v0` field names,
   and `FlutterEngine::messenger()` registration were written from
   the documented Win32/Flutter APIs without a Windows compiler to
@@ -318,16 +513,25 @@ lib/src/models.dart                    Counter contract (cumulative only)
 lib/src/format.dart                    Decimal MB / rate formatting
 lib/src/usage_service.dart             Channel source + rate maths +
                                        background-sampling channel methods
-lib/src/history.dart                   SQLite history (v1) + in-memory twin
+lib/src/history.dart                   SQLite history (v2, per-source) + in-memory twin
 lib/src/budget.dart                    Daily cap checker + local store
 lib/src/background.dart                Background-sample merge controller
+lib/src/vpn.dart                       VPN mode state, disclosure store,
+                                       reconciliation, VPN polling service
 windows/runner/mymy_usage.h/.cpp       Windows collector (IP Helper + EStats)
-android/.../MainActivity.kt            mymy/usage channel (Android engine)
+android/.../MainActivity.kt            mymy/usage channel (Android engine +
+                                       VPN consent flow, request code 1001)
 android/.../UsageSnapshotProvider.kt   Shared snapshot logic (UI + service)
 android/.../BackgroundSamplingService.kt  Foreground service, 1 sample/min
-android/.../AndroidManifest.xml        Permissions (no INTERNET, on purpose)
+android/.../VpnLiveService.kt          VPN service: TUN loop, TCP/UDP proxy,
+                                       attribution, counters, teardown
+android/.../VpnPacket.kt               IPv4/TCP/UDP parse + build, checksums
+android/.../AndroidManifest.xml        Permissions (no INTERNET, on purpose;
+                                       BIND_VPN_SERVICE + special-use FGS)
 test/usage_service_test.dart           Rate/format/parsing tests
 test/history_test.dart                 History, merge, budget, Windows JSON
+test/vpn_test.dart                     Mode defaults, disclosure, reconciliation,
+                                       VPN snapshot JSON, source separation
 test/widget_test.dart                  Dashboard smoke test (fake source)
 .github/workflows/build-apk.yml        CI: analyze + test + release APK
 .github/workflows/build-windows.yml    CI: analyze + test + Windows release

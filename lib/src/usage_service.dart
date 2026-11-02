@@ -13,6 +13,30 @@ abstract class UsageDataSource {
   Future<UsageSnapshot> getSnapshot();
 }
 
+/// Phase 3 VPN live mode channel methods.
+///
+/// Kept separate from [UsageDataSource] so fakes and non-Android
+/// platforms are not forced to implement them. On a platform whose
+/// native handler does not implement a method, the call degrades to
+/// 'error' / false / inactive instead of crashing.
+abstract class VpnLiveSource {
+  /// 'ready' (consent already held, or just granted), 'denied' (user
+  /// declined the system dialog), or 'error'.
+  Future<String> prepareVpn();
+  Future<bool> startVpnLive();
+  Future<bool> stopVpnLive();
+  Future<bool> isVpnLive();
+  Future<VpnStatus> getVpnStatus();
+
+  /// Cumulative VPN counters since the service started, as a
+  /// [UsageSnapshot] with `source == 'vpn'`. Totals are sums of the
+  /// per-app VPN counters (plus unattributed), NOT device boot
+  /// counters — rates are still derived from deltas, so this is safe,
+  /// but it must never be compared directly to a polling snapshot's
+  /// boot totals. See Reconciliation in lib/src/vpn.dart.
+  Future<UsageSnapshot> getVpnSnapshot();
+}
+
 /// Background sampling (Android foreground service) channel methods.
 ///
 /// Kept separate from [UsageDataSource] so fakes and non-Android
@@ -33,7 +57,7 @@ abstract class BackgroundSamplingSource {
 /// collector in windows/runner/mymy_usage.cpp. Any other platform:
 /// no handler, so [getStatus] reports 'unimplemented'.
 class MethodChannelUsageDataSource
-    implements UsageDataSource, BackgroundSamplingSource {
+    implements UsageDataSource, BackgroundSamplingSource, VpnLiveSource {
   MethodChannelUsageDataSource({MethodChannel? channel})
       : _channel = channel ?? const MethodChannel('mymy/usage');
 
@@ -118,6 +142,62 @@ class MethodChannelUsageDataSource
     try {
       await _channel.invokeMethod<void>('clearBackgroundSamples');
     } catch (_) {}
+  }
+
+  @override
+  Future<String> prepareVpn() async {
+    try {
+      return await _channel.invokeMethod<String>('prepareVpn') ?? 'error';
+    } catch (_) {
+      return 'error';
+    }
+  }
+
+  @override
+  Future<bool> startVpnLive() async {
+    try {
+      return await _channel.invokeMethod<bool>('startVpnLive') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> stopVpnLive() async {
+    try {
+      return await _channel.invokeMethod<bool>('stopVpnLive') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> isVpnLive() async {
+    try {
+      return await _channel.invokeMethod<bool>('isVpnLive') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<VpnStatus> getVpnStatus() async {
+    try {
+      final raw = await _channel.invokeMethod<Map>('getVpnStatus');
+      if (raw == null) return VpnStatus.inactive;
+      return VpnStatus.fromJson(Map<String, dynamic>.from(raw));
+    } catch (_) {
+      return VpnStatus.inactive;
+    }
+  }
+
+  @override
+  Future<UsageSnapshot> getVpnSnapshot() async {
+    final raw = await _channel.invokeMethod<Map>('getVpnSnapshot');
+    if (raw == null) {
+      throw StateError('mymy/usage getVpnSnapshot returned no data');
+    }
+    return UsageSnapshot.fromJson(Map<String, dynamic>.from(raw));
   }
 
   UsageStatus _unimplementedStatus() => const UsageStatus(
