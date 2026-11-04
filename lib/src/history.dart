@@ -89,6 +89,7 @@ class HistorySummary {
     required this.yesterday,
     required this.last7Days,
     required this.perAppToday,
+    this.last7Daily = const [],
   });
 
   final DailyTotal today;
@@ -97,6 +98,12 @@ class HistorySummary {
 
   /// Per-app totals recorded today, largest first.
   final List<AppDaily> perAppToday;
+
+  /// Phase 5: one [DailyTotal] per day for the last 7 days, oldest
+  /// first, zero-filled for days with no recorded samples. Drives the
+  /// History daily bar chart. A zero day means "nothing recorded",
+  /// never "used nothing" — see the recorded-while-sampling rule.
+  final List<DailyTotal> last7Daily;
 
   AppDaily? get biggestUserToday =>
       perAppToday.isEmpty ? null : perAppToday.first;
@@ -311,6 +318,17 @@ class InMemoryHistoryStore implements HistoryStore {
           ),
       last7Days: totalFor(last7Keys),
       perAppToday: perApp,
+      last7Daily: [
+        for (final key in last7Keys.reversed)
+          _daily[key] ??
+              DailyTotal(
+                date: key,
+                rxBytes: 0,
+                txBytes: 0,
+                mobileRxBytes: -1,
+                mobileTxBytes: -1,
+              ),
+      ],
     );
   }
 
@@ -334,6 +352,17 @@ class SqliteHistoryStore implements HistoryStore {
 
   static Future<HistoryStore> open() async {
     try {
+      return await openStrict();
+    } catch (_) {
+      return InMemoryHistoryStore();
+    }
+  }
+
+  /// Same as [open] but throws instead of substituting the in-memory
+  /// fallback, so [openHistoryStore] can report the real cause.
+  /// Existing callers that want the silent fallback keep using [open].
+  static Future<HistoryStore> openStrict() async {
+    {
       final dir = await getApplicationDocumentsDirectory();
       final path = p.join(dir.path, 'mymy_history.db');
       dynamic db;
@@ -402,8 +431,6 @@ class SqliteHistoryStore implements HistoryStore {
         }
       }
       return SqliteHistoryStore._(db, lastBySource);
-    } catch (_) {
-      return InMemoryHistoryStore();
     }
   }
 
@@ -574,10 +601,15 @@ class SqliteHistoryStore implements HistoryStore {
       whereArgs: [todayKey],
       orderBy: '(rx + tx) DESC',
     );
+    final last7Daily = <DailyTotal>[];
+    for (final key in last7Keys.reversed) {
+      last7Daily.add(await totalFor([key]));
+    }
     return HistorySummary(
       today: await totalFor([todayKey]),
       yesterday: await totalFor([yesterdayKey]),
       last7Days: await totalFor(last7Keys),
+      last7Daily: last7Daily,
       perAppToday: perAppRows
           .map(
             (r) => AppDaily(
@@ -598,6 +630,61 @@ class SqliteHistoryStore implements HistoryStore {
     try {
       await _db.close();
     } catch (_) {}
+  }
+}
+
+/// Result of opening a history store (Phase 5).
+///
+/// [error] is null when SQLite opened normally. When it is non-null
+/// the returned [store] is an in-memory fallback and the UI must show
+/// [error] alongside the in-memory warning — a failed open must never
+/// leave the History tab on a silent spinner.
+class HistoryOpenResult {
+  const HistoryOpenResult({required this.store, required this.error});
+
+  final HistoryStore store;
+  final String? error;
+
+  bool get fellBack => error != null;
+}
+
+/// Opens the history store, never leaving the caller without one.
+///
+/// Phase 5 root-cause fix for "could not load history": the old
+/// dashboard code did `SqliteHistoryStore.open().then(...)` with no
+/// error handler and no timeout, so a hung or throwing open left
+/// `_history` null forever and the History tab spun forever with no
+/// error and no Retry. This helper always resolves: on a throw, or
+/// on a [timeout] (default 15 s), it returns an in-memory store plus
+/// the cause, so the UI can show the warning and offer Retry.
+/// [opener] exists for tests; production passes
+/// `SqliteHistoryStore.openStrict`, which throws instead of silently
+/// substituting the fallback, so the cause is preserved here.
+Future<HistoryOpenResult> openHistoryStore({
+  Future<HistoryStore> Function()? opener,
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  try {
+    final store = await (opener?.call() ??
+            SqliteHistoryStore.openStrict())
+        .timeout(timeout);
+    if (store.isPersistent) {
+      return HistoryOpenResult(store: store, error: null);
+    }
+    // An opener that silently substituted its own fallback (the old
+    // SqliteHistoryStore.open behaviour): still surface it as a
+    // fallback with a cause, never as a silent success.
+    return HistoryOpenResult(
+      store: store,
+      error: 'SQLite could not be opened on this device. '
+          'History is in-memory only for this session.',
+    );
+  } catch (e) {
+    return HistoryOpenResult(
+      store: InMemoryHistoryStore(),
+      error: 'SQLite could not be opened: $e. '
+          'History is in-memory only for this session.',
+    );
   }
 }
 

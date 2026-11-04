@@ -6,13 +6,14 @@ is using right now and in total. One codebase, one dashboard UI, a
 different native collector per platform. All data stays on the device.
 There is no server, no account, and no data leaves the phone or laptop.
 
-**Status: Phase 4 built locally, NOT pushed to GitHub** (this tree is
+**Status: Phase 5 built locally, NOT pushed to GitHub** (this tree is
 local-only by instruction; workflows are manual-only and pending a
 separate web upload). `flutter analyze` + `flutter test` are the local
 proof so far; a real device / real Windows machine is still required
 before any "it works" claim (see § Testing). Phase 3's VPN forwarding
-path and Phase 4's two-device pairing are both **unproven on real
-devices** — see § Phase 3 honest limits and § Phase 4 honest limits.
+path, Phase 4's two-device pairing, and all of Phase 5 are
+**unproven on real devices** — see § Phase 3 honest limits, § Phase 4
+honest limits, and § Phase 5 honest limits.
 
 ## The one design rule
 
@@ -496,6 +497,228 @@ section.
   read the remote device's full history, change its settings, or
   start/stop anything on it. Pairing is view-only, by design.
 
+## Phase 5 — History fix, all-apps list, graphs, Live System Map, glass style (BUILT, local only)
+
+Dennis reported 2026-11-04 "could not load history" and asked for:
+(1) all apps using mobile data including installed apps with
+icons/names, system apps, and background-running apps; (2) a
+dashboard in graph format with different graph types and their uses;
+(3) a "neural link" graph of how phone apps connect in real time;
+(4) a professional clean glass corporate dashboard style. All four
+are built here, inside the existing honesty rules: nothing is
+invented, derived values are never presented as measured, and
+anything unproven on a real phone is labelled as such below.
+
+### 5.1 History loading — root cause found and fixed
+
+The bug was in the dashboard, not in SQLite. The old code did
+`SqliteHistoryStore.open().then(...)` with **no error handler, no
+timeout, and no loading/error state**: if the open future hung
+(e.g. a slow or stuck platform channel) or threw outside the
+store's own catch, `_history` stayed null forever and the History
+tab showed a bare spinner forever — no error, no Retry, nothing to
+tap. (The store's own catch already substituted an in-memory
+fallback on a clean throw, so the spinner case was the hung /
+never-resolving open, which the widget test reproduced: the old
+smoke test's real open never resolved under flutter_test, and only
+the absence of a timer exposed it.)
+
+Fix (`lib/src/history.dart`, `lib/main.dart`):
+- `SqliteHistoryStore.openStrict()` throws instead of silently
+  substituting the fallback, so the cause is preserved;
+  `openHistoryStore()` wraps it with a 15-second timeout and
+  always resolves: persistent store + no error, or in-memory store
+  + the cause as a visible string.
+- The History tab now has three states, never one spinner: loading
+  shows "Loading history…", a failed open shows its cause with a
+  Retry button (Retry re-attempts SQLite; a successful retry swaps
+  the store in, but session-only records made under the fallback
+  are not migrated — they were never persisted), and a fallback
+  store shows the existing in-memory warning plus the cause.
+- Summary staleness fixed: the old `_summaryFuture` was cached once
+  forever. HistoryTab now re-reads its summary when the dashboard
+  reports the tab was opened (TabController listener bumps a
+  refresh token) and after a background merge, not only on manual
+  Refresh. A pre-existing `setState` bug surfaced by the new Retry
+  test was also fixed: Retry/Refresh passed a Future-returning
+  closure to `setState`, which Flutter rejects.
+- The honest definition is unchanged: recorded-while-sampling only,
+  never invented full-day totals.
+
+### 5.2 All-apps list (Android primary)
+
+Native (`UsageSnapshotProvider.kt`): `getInstalledApps` enumerates
+via `PackageManager.getInstalledApplications`, including system
+apps (flagged `isSystem`, with enabled/disabled state and UID),
+and the per-UID totals now keep the mobile split separate
+(`mobileRx`/`mobileTx`, -1 = unknown) instead of summing blindly.
+Dart (`lib/src/all_apps.dart`) merges installed + stats: every
+installed app appears, zero-usage apps shown as 0 / "No data
+today", never hidden and never given fake bytes; data rows with no
+installed entry are still shown (labelled as not from the installed
+list). Filter chips: All / Data users only / System / User apps.
+Sort is unchanged: current rate, then total.
+Icons: native `getAppIcon` encodes one icon to a PNG of at most
+96 px; Dart loads icons lazily for visible rows only (`_AppIcon`,
+placeholder letter until loaded) and caches results in memory —
+the dashboard is never blocked on hundreds of icons, and a failed
+icon load caches as placeholder, not retried per frame.
+Windows: unchanged collector processes, labelled in the UI as
+"processes seen by the collector" — no installed-apps list and no
+icons are claimed there.
+
+### 5.3 Background / running state — honestly
+
+Android does not let an ordinary app list other apps' live
+processes completely, and per-app battery drain is not available.
+So badges derive only from observable signals
+(`UsageSnapshotProvider.getAppActivity` + `lib/src/all_apps.dart`
+`activityBadge`):
+- UsageStatsManager (usage access already required): foreground
+  time today and last-used time.
+- ActivityManager running-process list, where the OS actually
+  returns it — a package absent from it is "not reported running",
+  never "proven not running".
+Badge rule: "Foreground now" = OS-reported running, or last used
+within 2 minutes; "Background recently" = used within 24 hours;
+"Not recently used" = older or no record; "Activity unknown" = no
+activity signal reached Dart at all. The badge means recent
+usage-stats activity, NOT a claimed live process list, and the
+code + UI say so. Foreground minutes are labelled "foreground
+time", never "battery use".
+
+### 5.4 Graphs (CustomPaint, no new chart dependency)
+
+`fl_chart` was deliberately NOT added: it would be a new
+dependency whose integration could only be proven by a build, and
+the lightweight CustomPaint widgets below are fully testable in
+pure Dart. `lib/src/charts.dart` holds the pure builders;
+`lib/src/chart_widgets.dart` the widgets. Every chart carries a
+one-line caption stating the question it answers, and an empty
+state says "No data yet" — never a sample curve.
+- Live rate line/area chart: session ring buffer of 1-second
+  snapshots (default last 180 samples ≈ 3 minutes), down cyan /
+  up indigo, peak labelled. Answers "When did usage spike?"
+- Per-app bar chart: top 10 by total. Answers "Which app used the
+  most?"
+- Donut/share chart: share of total by app, top apps + Other,
+  shares summing to 1. Answers "How is usage shared between apps?"
+- History daily bar chart: last 7 days from
+  `HistorySummary.last7Daily` (new optional field, zero-filled for
+  unrecorded days). Answers "How much was recorded each day?"
+All charts are built from real snapshots / recorded history only.
+
+### 5.5 Live System Map — the "neural link" graph, honestly labelled
+
+The UI calls it "Live System Map", NOT proof that apps share data
+with each other, and its legend states the boundary in full.
+`lib/src/system_map.dart` builds it; `lib/src/system_map_widget.dart`
+draws it (device hub centre, live-rate apps on a ring, transport /
+feature / group nodes outer, node size by live rate, colour by
+state). It updates with the live poll.
+
+Edges exist ONLY where a real signal exists:
+- App → Mobile / Wi-Fi: the app's own per-transport totals
+  (mobile split measured and > 0, or derived Wi-Fi bytes > 0).
+  Unknown split (-1, e.g. Windows or VPN snapshots) means no edge.
+- App → phone feature: AppOpsManager actually reported that op as
+  allowed for that package (Camera, Microphone, Fine location).
+  No signal means no badge and no edge.
+- App → "same app group" node: two or more installed packages share
+  one Linux UID (verifiable from PackageManager). A packaging fact,
+  not a data-sharing claim.
+NO app-to-app "data sharing" edges, NO per-app battery numbers:
+battery is device-level only (BatteryManager level + charging,
+shown on the hub node), and the tests assert both rules — no edge
+with two app endpoints, and no app node mentioning battery.
+Android does not expose real-time inter-app data sharing, so the
+map shows what is measurable, not an invented network. This
+boundary is also stated in the README in plain language.
+
+### 5.6 Glass corporate style
+
+`lib/src/glass.dart`: the existing logo palette, not a rebrand —
+deep navy/indigo gradient background, indigo → cyan accent, white
+text. Cards are frosted glass (translucent white fill, thin white
+border, blur over the gradient) with generous spacing; body text
+is always white / white70+ on the dark gradient, never grey-on-
+gradient. All three tabs use it (Live, History, Devices). The
+Devices QR code keeps a white backing so it stays scannable on the
+dark card. `withOpacity` is kept deliberately (not `withValues`)
+because the CI workflows pin Flutter 3.24.5, which predates
+`withValues` — the local 3.47 SDK flags it as a deprecation info
+only; see the verification note below.
+
+### Phase 5 honest limits (read before claiming anything)
+
+- **Nothing in Phase 5 is proven on a real phone.** `flutter
+  analyze` (5 infos, all the intentional `withOpacity` notes) +
+  `flutter test` 65/65 pass locally (Linux VM). They prove Dart
+  logic (open fallback, error + Retry, refresh, merge, chart
+  builders, map edge rules) and the UI shell — NOT the Kotlin
+  (needs an Android SDK + phone, absent here) and NOT the glass
+  rendering, icon cost, or map readability on a real screen.
+  Do not claim history is fixed or the map is real-time until a
+  real phone proves it.
+- **Installed-list completeness is unverified.** Phase 5 does NOT
+  add `QUERY_ALL_PACKAGES` (Play policy risk: it is a restricted
+  permission needing a declaration). On Android 11+,
+  `getInstalledApplications` is subject to package-visibility
+  filtering, so the list may be incomplete on a real phone. Device
+  test: compare the All-apps count against Settings → Apps before
+  any completeness claim; if it is short, `QUERY_ALL_PACKAGES`
+  with a Play declaration is the flagged follow-up, not a silent
+  addition.
+- **AppOps feature badges are unverified.** Cross-package
+  `AppOpsManager.checkOpNoThrow` may return nothing on some
+  devices / OS versions. The code treats that as "no signal" (no
+  badges), which is safe but means badges may simply be absent on
+  a real phone — a finding to report, not a reason to guess.
+  The same applies to the ActivityManager running-process list,
+  which modern Android deliberately limits.
+- **Icon loading cost on a phone with hundreds of apps is
+  unmeasured.** Icons load lazily per visible row and are capped
+  at 96 px, but total channel traffic and scroll jank on a
+  low-end phone are device-test items.
+- **Windows scope is unchanged.** No Windows installed-apps list,
+  no Windows icons, no Windows transport edges (no per-process
+  mobile split from the collector). The Windows list is labelled
+  as collector processes wherever it appears.
+- **Map layout is a ring layout, not a physics graph.** With many
+  live apps the ring crowds; node labels truncate. Readability at
+  high app counts is a device-test item, and the map only shows
+  apps with a live rate — a zero-rate app with data today is not
+  a "live" node by design.
+- **Chart history is session-only.** The rate chart covers the
+  current app session's last ~3 minutes; closing the app clears
+  it. It is not a day chart, and must never be described as one.
+
+### Phase 5 device tests (in addition to the earlier lists)
+
+1. History: with the app open, confirm the History tab loads
+   (never a bare spinner); kill and reopen repeatedly; if SQLite
+   ever fails, confirm the in-memory warning + cause + Retry
+   appear and Retry recovers.
+2. All apps: compare the All-apps count and system badges against
+   Settings → Apps; confirm zero-data apps show "No data today"
+   with 0 bytes; scroll a phone with 200+ apps and note icon load
+   behaviour and any jank.
+3. Badges: use an app, return within 2 minutes (expect "Foreground
+   now"), then after a day of non-use (expect "Not recently
+   used"); confirm no badge ever claims an app is "running" from
+   the OS list alone.
+4. Graphs: stream for a minute and confirm the rate chart spikes,
+   the top-10 bars and donut match the per-app list, and the
+   History daily bars match recorded totals (including a zero day).
+5. Map: with 2–3 apps actively using data, confirm transport edges
+   match the actual connection (mobile vs Wi-Fi), feature badges
+   appear only where the app genuinely holds the permission, no
+   line ever claims two apps share data, and battery appears only
+   at device level.
+6. Glass: check every card in sunlight / low brightness for
+   readable contrast, and scan the Devices QR code off the dark
+   card.
+
 ## Permissions the user must grant
 
 | Device | Grant | How | If not granted |
@@ -671,35 +894,61 @@ installed. Do them on a trusted home Wi-Fi only — Phase 4 has no TLS
 ## File map
 
 ```
-lib/main.dart                          Live + History + Devices tabs, budget banner
-lib/src/models.dart                    Counter contract (cumulative only)
+lib/main.dart                          Live + History + Devices tabs, budget banner,
+                                       Phase 5 glass theme, charts, all-apps card,
+                                       Live System Map, history open/retry/refresh
+lib/src/models.dart                    Counter contract (cumulative only) +
+                                       Phase 5 per-app mobile split
 lib/src/format.dart                    Decimal MB / rate formatting
 lib/src/usage_service.dart             Channel source + rate maths +
                                        background-sampling channel methods
-lib/src/history.dart                   SQLite history (v2, per-source) + in-memory twin
+lib/src/history.dart                   SQLite history (v2, per-source) + in-memory twin +
+                                       Phase 5 openHistoryStore (fallback + cause +
+                                       timeout) + last7Daily for the daily chart
 lib/src/budget.dart                    Daily cap checker + local store
 lib/src/background.dart                Background-sample merge controller
 lib/src/vpn.dart                       VPN mode state, disclosure store,
                                        reconciliation, VPN polling service
 lib/src/devices.dart                   LAN host server, pairing payload,
                                        PIN + token, guest poller, store
+lib/src/app_info.dart                  Phase 5: installed apps, activity,
+                                       icons, device battery (channel source)
+lib/src/all_apps.dart                  Phase 5: installed+stats merge, filters,
+                                       sort, honest activity badges
+lib/src/charts.dart                    Phase 5: pure chart-data builders
+                                       (rate ring buffer, top 10, donut, daily)
+lib/src/chart_widgets.dart             Phase 5: CustomPaint rate/donut charts,
+                                       bar lists, daily bars, captions
+lib/src/system_map.dart                Phase 5: Live System Map model + edge
+                                       rules (no app-to-app sharing edges)
+lib/src/system_map_widget.dart         Phase 5: map canvas + legend
+lib/src/glass.dart                     Phase 5: navy/indigo gradient theme +
+                                       frosted-glass card
 windows/runner/mymy_usage.h/.cpp       Windows collector (IP Helper + EStats)
 android/.../MainActivity.kt            mymy/usage channel (Android engine +
-                                       VPN consent flow, request code 1001)
-android/.../UsageSnapshotProvider.kt   Shared snapshot logic (UI + service)
+                                       VPN consent flow, request code 1001 +
+                                       Phase 5 installed/activity/icon/battery)
+android/.../UsageSnapshotProvider.kt   Shared snapshot logic (UI + service) +
+                                       Phase 5 installed list, per-transport
+                                       splits, UsageStats/AppOps, icons, battery
 android/.../BackgroundSamplingService.kt  Foreground service, 1 sample/min
 android/.../VpnLiveService.kt          VPN service: TUN loop, TCP/UDP proxy,
                                        attribution, counters, teardown
 android/.../VpnPacket.kt               IPv4/TCP/UDP parse + build, checksums
 android/.../AndroidManifest.xml        Permissions (INTERNET LAN-only, Phase 4;
-                                       BIND_VPN_SERVICE + special-use FGS)
+                                       BIND_VPN_SERVICE + special-use FGS;
+                                       QUERY_ALL_PACKAGES deliberately NOT
+                                       added — see Phase 5 honest limits)
 test/usage_service_test.dart           Rate/format/parsing tests
 test/history_test.dart                 History, merge, budget, Windows JSON
 test/vpn_test.dart                     Mode defaults, disclosure, reconciliation,
                                        VPN snapshot JSON, source separation
 test/devices_test.dart                 Payload allowlist, PIN/token rules,
                                        rates, stale/offline, host loopback
-test/widget_test.dart                  Dashboard smoke test (fake source)
+test/widget_test.dart                  Dashboard smoke test (fake source,
+                                       history store injected)
+test/phase5_test.dart                  History fallback/retry/refresh, all-apps
+                                       merge, chart builders, system-map edges
 .github/workflows/build-apk.yml        CI: analyze + test + release APK
 .github/workflows/build-windows.yml    CI: analyze + test + Windows release
 ```

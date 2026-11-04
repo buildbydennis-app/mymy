@@ -1,10 +1,14 @@
 // Dashboard smoke test: the app renders its live dashboard shell with a
 // fake usage source. It asserts no sample/demo numbers are shown as real
 // data — the fake source's counters are the only numbers on screen.
+// The history store is injected: the real open path (openHistoryStore,
+// 15 s timeout) is covered by phase5_test.dart, and its timeout timer
+// would otherwise linger in the test's fake async clock.
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mymy/main.dart';
 import 'package:mymy/src/models.dart';
+import 'package:mymy/src/history.dart';
 import 'package:mymy/src/usage_service.dart';
 
 void main() {
@@ -22,7 +26,12 @@ void main() {
       source: FakeUsageDataSource([snapshot]),
     );
     await tester.pumpWidget(
-      MaterialApp(home: DashboardPage(service: service)),
+      MaterialApp(
+        home: DashboardPage(
+          service: service,
+          historyStore: InMemoryHistoryStore(),
+        ),
+      ),
     );
     await tester.pump();
     // Advance past one 1-second poll tick so the snapshot is displayed.

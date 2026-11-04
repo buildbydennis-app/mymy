@@ -1,15 +1,21 @@
 import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import 'src/all_apps.dart';
+import 'src/app_info.dart';
 import 'src/background.dart';
 import 'src/budget.dart';
+import 'src/chart_widgets.dart';
+import 'src/charts.dart';
 import 'src/devices.dart';
 import 'src/format.dart';
+import 'src/glass.dart';
 import 'src/history.dart';
 import 'src/models.dart';
+import 'src/system_map.dart';
+import 'src/system_map_widget.dart';
 import 'src/usage_service.dart';
 import 'src/vpn.dart';
 
@@ -24,10 +30,9 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MyMy — Live Data Usage',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
-        useMaterial3: true,
-      ),
+      // Phase 5 glass corporate style: dark navy/indigo gradient,
+      // indigo -> cyan accent, white text. See lib/src/glass.dart.
+      theme: myMyGlassTheme(),
       home: const DashboardPage(),
     );
   }
@@ -50,14 +55,20 @@ class DashboardPage extends StatefulWidget {
     this.historyStore,
     this.backgroundSource,
     this.vpnSource,
+    this.appInfoSource,
   });
 
   final UsageService? service;
 
-  /// Injected in tests; otherwise SQLite is opened (with an in-memory
-  /// fallback if SQLite is unavailable).
+  /// Injected in tests; otherwise SQLite is opened via
+  /// [openHistoryStore] (in-memory fallback + visible cause + Retry
+  /// on failure — never a silent spinner).
   final HistoryStore? historyStore;
   final BackgroundSamplingSource? backgroundSource;
+
+  /// Injected in tests; otherwise the platform-channel source
+  /// (Android installed list / activity / icons / battery).
+  final AppInfoSource? appInfoSource;
 
   /// Injected in tests; otherwise derived from the channel source
   /// (Android only — the method channel implements it there).
@@ -67,11 +78,34 @@ class DashboardPage extends StatefulWidget {
   State<DashboardPage> createState() => _DashboardPageState();
 }
 
-class _DashboardPageState extends State<DashboardPage> {
+class _DashboardPageState extends State<DashboardPage>
+    with SingleTickerProviderStateMixin {
   late UsageService _service;
   late VpnPollingService _vpnPolling;
+  late TabController _tabController;
   HistoryStore? _history;
+
+  /// Phase 5 history-open state. [_historyError] is the cause when
+  /// the open fell back to in-memory; [_historyLoading] is true only
+  /// while the first open is in flight, and the History tab shows
+  /// "Loading history…" (not a bare spinner) plus a Retry on error.
+  String? _historyError;
+  bool _historyLoading = true;
+
+  /// Bumped whenever the History tab is opened, so HistoryTab
+  /// re-reads its summary instead of serving the cached one.
+  int _historyRefreshToken = 0;
   BudgetStore? _budgetStore;
+
+  // Phase 5 live data: recent rate samples for the rate chart,
+  // installed apps + activity for the all-apps list and system map.
+  final RateHistory _rateHistory = RateHistory();
+  AppInfoSource? _appInfoSource;
+  List<InstalledApp> _installed = const [];
+  Map<String, AppActivity> _activity = const {};
+  DeviceBattery? _battery;
+  final Map<String, Uint8List?> _iconCache = {};
+  final Set<String> _iconLoading = {};
   BackgroundSamplingSource? _backgroundSource;
   VpnLiveSource? _vpnSource;
   UsageStatus? _status;
@@ -105,7 +139,17 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+    _tabController.addListener(() {
+      // Refresh history whenever the tab is opened, not only on
+      // manual Refresh — the old cached-future tab went stale.
+      if (!_tabController.indexIsChanging && _tabController.index == 1) {
+        setState(() => _historyRefreshToken++);
+      }
+    });
     _service = widget.service ?? UsageService();
+    _appInfoSource =
+        widget.appInfoSource ?? MethodChannelAppInfoSource();
     final source = _service.source;
     BackgroundSamplingSource? background = widget.backgroundSource;
     if (background == null && source is BackgroundSamplingSource) {
@@ -121,15 +165,72 @@ class _DashboardPageState extends State<DashboardPage> {
     _checkRestoredVpn();
     if (widget.historyStore != null) {
       _history = widget.historyStore;
+      _historyLoading = false;
     } else {
-      SqliteHistoryStore.open().then((store) {
-        if (!mounted) return;
-        setState(() => _history = store);
-        _maybeMergeBackground();
-      });
+      _openHistory();
     }
     _loadBudget();
     _refreshStatusAndStart();
+  }
+
+  /// Phase 5: opens history through [openHistoryStore], which always
+  /// resolves — fallback store + cause on failure, never a null
+  /// store left spinning. Retry re-attempts SQLite; a successful
+  /// retry replaces the in-memory store (session-only records made
+  /// under the fallback are not migrated — they were never
+  /// persisted, and the fallback banner says so).
+  Future<void> _openHistory() async {
+    setState(() => _historyLoading = true);
+    final result = await openHistoryStore();
+    if (!mounted) return;
+    final previous = _history;
+    setState(() {
+      // Only swap in a persistent store, or the first store ever.
+      // A failed retry keeps the working fallback instead of
+      // swapping one fallback for another.
+      if (result.store.isPersistent || previous == null) {
+        _history = result.store;
+      }
+      _historyError = result.error;
+      _historyLoading = false;
+    });
+    _maybeMergeBackground();
+  }
+
+  Future<void> _loadAppInfo() async {
+    final source = _appInfoSource;
+    if (source == null) return;
+    try {
+      final installed = await source.getInstalledApps();
+      final activity = await source.getAppActivity();
+      final battery = await source.getBattery();
+      if (!mounted) return;
+      setState(() {
+        _installed = installed;
+        _activity = activity;
+        _battery = battery;
+      });
+    } catch (_) {
+      // App info is best-effort: the dashboard still works from
+      // snapshot data alone, labelled as such.
+    }
+  }
+
+  /// Lazy icon load for one visible row. Icons are never fetched for
+  /// the whole list up front: a phone with hundreds of apps would
+  /// stall the dashboard on icon bytes. A failed load caches null
+  /// (placeholder letter) and is not retried per frame.
+  Future<Uint8List?> _loadIcon(String packageName) async {
+    if (_iconCache.containsKey(packageName)) {
+      return _iconCache[packageName];
+    }
+    if (_iconLoading.contains(packageName)) return null;
+    _iconLoading.add(packageName);
+    final bytes = await _appInfoSource?.getAppIcon(packageName);
+    _iconLoading.remove(packageName);
+    _iconCache[packageName] = bytes;
+    if (mounted) setState(() {});
+    return bytes;
   }
 
   Future<void> _loadDisclosure() async {
@@ -186,6 +287,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
   @override
   void dispose() {
+    _tabController.dispose();
     _timer?.cancel();
     final last = _lastSnapshot;
     if (last != null) {
@@ -226,6 +328,7 @@ class _DashboardPageState extends State<DashboardPage> {
       _error = null;
     });
     _maybeMergeBackground();
+    _loadAppInfo();
     if (status.engine != 'unimplemented') {
       _startPolling();
     }
@@ -242,6 +345,14 @@ class _DashboardPageState extends State<DashboardPage> {
             : await _service.poll();
         if (!mounted) return;
         _lastSnapshot = live.snapshot;
+        // Feed the live rate chart (last ~3 minutes at 1 Hz).
+        _rateHistory.add(
+          RatePoint(
+            timestamp: live.snapshot.timestamp,
+            rxBytesPerSecond: live.rxBytesPerSecond,
+            txBytesPerSecond: live.txBytesPerSecond,
+          ),
+        );
         // History records only the active mode's snapshots. The
         // store keeps a separate baseline per source, so a mode
         // switch never invents a delta — but recording both modes
@@ -451,44 +562,53 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   Widget build(BuildContext context) {
     final status = _status;
-    return DefaultTabController(
-      length: 3,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('MyMy — Live Data Usage'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              tooltip: 'Refresh',
-              onPressed: _refreshStatusAndStart,
-            ),
-          ],
-          bottom: const TabBar(
-            tabs: [
-              Tab(text: 'Live'),
-              Tab(text: 'History'),
-              Tab(text: 'Devices'),
-            ],
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('MyMy — Live Data Usage'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: 'Refresh',
+            onPressed: _refreshStatusAndStart,
           ),
+        ],
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'Live'),
+            Tab(text: 'History'),
+            Tab(text: 'Devices'),
+          ],
         ),
-        body: status == null
-            ? const Center(child: CircularProgressIndicator())
-            : TabBarView(
-                children: [
-                  _buildLiveTab(status),
-                  HistoryTab(
-                    history: _history,
-                    budgetStore: _budgetStore,
-                    backgroundSource: _backgroundSource,
-                    backgroundOn: _backgroundOn,
-                    mergedCount: _mergedCount,
-                    onToggleBackground: _toggleBackground,
-                    onMerge: () async {
-                      _mergedOnce = false;
-                      await _maybeMergeBackground();
-                    },
-                  ),
-                  DevicesTab(
+      ),
+      body: GradientBackground(
+        child: SafeArea(
+          child: status == null
+              ? const Center(child: CircularProgressIndicator())
+              : TabBarView(
+                  controller: _tabController,
+                  children: [
+                    _buildLiveTab(status),
+                    HistoryTab(
+                      history: _history,
+                      historyLoading: _historyLoading,
+                      historyError: _historyError,
+                      onRetryHistory: _openHistory,
+                      refreshToken: _historyRefreshToken,
+                      budgetStore: _budgetStore,
+                      backgroundSource: _backgroundSource,
+                      backgroundOn: _backgroundOn,
+                      mergedCount: _mergedCount,
+                      onToggleBackground: _toggleBackground,
+                      onMerge: () async {
+                        _mergedOnce = false;
+                        await _maybeMergeBackground();
+                        if (mounted) {
+                          setState(() => _historyRefreshToken++);
+                        }
+                      },
+                    ),
+                    DevicesTab(
                     getLocalSnapshot: () => _service.source.getSnapshot(),
                     getTodayTotal: () async {
                       final history = _history;
@@ -502,7 +622,37 @@ class _DashboardPageState extends State<DashboardPage> {
                   ),
                 ],
               ),
+        ),
       ),
+    );
+  }
+
+  /// Builds the Live System Map from the current live snapshot.
+  /// Transport bytes come from the snapshot's per-app mobile split;
+  /// unknown splits (-1) yield no transport edge. See system_map.dart
+  /// for the full honesty boundary.
+  SystemMap _buildSystemMap(LiveUsage live) {
+    final byId = {for (final a in live.snapshot.apps) a.id: a};
+    final rates = <String, double>{};
+    for (final entry in live.appRates.entries) {
+      rates[entry.key] = entry.value.rxPerSecond + entry.value.txPerSecond;
+    }
+    final merged = attachActivity(
+      mergeApps(
+        installed: _installed,
+        stats: live.snapshot.apps,
+        rates: rates,
+      ),
+      _activity,
+    );
+    return buildSystemMap(
+      apps: merged,
+      installedById: {for (final a in _installed) a.packageName: a},
+      mobileBytesOf: (app) => byId[app.id]?.mobileBytes ?? -1,
+      wifiBytesOf: (app) => byId[app.id]?.wifiBytes ?? -1,
+      rateOf: (app) => app.rateBytesPerSecond,
+      now: DateTime.now(),
+      battery: _battery,
     );
   }
 
@@ -539,7 +689,7 @@ class _DashboardPageState extends State<DashboardPage> {
           const SizedBox(height: 12),
         ],
         if (_vpnState.mode == LiveMode.vpn)
-          Card(
+          GlassCard(
             color: Theme.of(context).colorScheme.primaryContainer,
             child: const Padding(
               padding: EdgeInsets.all(16),
@@ -562,7 +712,7 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
           ),
         if (_vpnError.isNotEmpty)
-          Card(
+          GlassCard(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Text(_vpnError),
@@ -574,7 +724,7 @@ class _DashboardPageState extends State<DashboardPage> {
         if (status.engine == 'network-stats' && !status.hasPermission)
           _PermissionBanner(onOpenSettings: _openSettings),
         if (status.engine == 'windows-ip-helper' && !status.hasPermission)
-          const Card(
+          const GlassCard(
             child: Padding(
               padding: EdgeInsets.all(16),
               child: Column(
@@ -596,7 +746,7 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
           ),
         if (status.engine == 'unimplemented')
-          Card(
+          GlassCard(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
@@ -613,7 +763,7 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
           ),
         if (_budgetCrossed)
-          Card(
+          GlassCard(
             color: Theme.of(context).colorScheme.errorContainer,
             child: const Padding(
               padding: EdgeInsets.all(16),
@@ -635,7 +785,7 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
           ),
         if (_error != null)
-          Card(
+          GlassCard(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
@@ -659,11 +809,90 @@ class _DashboardPageState extends State<DashboardPage> {
         if (snapshot != null) ...[
           _LiveRateCard(live: live!),
           const SizedBox(height: 12),
+          GlassCard(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const ChartCaption(
+                    question: 'When did usage spike?',
+                    note: 'Live down/up rate over the last few minutes '
+                        '(1-second polls, real counters only).',
+                  ),
+                  const SizedBox(height: 12),
+                  RateAreaChart(history: _rateHistory),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
           _TotalsCard(snapshot: snapshot),
           const SizedBox(height: 12),
           if (snapshot.mobileRxBytes >= 0) _NetworkSplitCard(snapshot: snapshot),
           if (snapshot.mobileRxBytes >= 0) const SizedBox(height: 12),
-          _PerAppCard(live: live),
+          GlassCard(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const ChartCaption(
+                    question: 'Which app used the most?',
+                    note: 'Top 10 by total in this snapshot window. '
+                        'Android: today; Windows: since collector start.',
+                  ),
+                  const SizedBox(height: 12),
+                  TopAppsBarList(
+                    apps: topAppsByTotal(snapshot.apps),
+                  ),
+                  const SizedBox(height: 16),
+                  const ChartCaption(
+                    question: 'How is usage shared between apps?',
+                    note: 'Share of total data by app, top apps + Other.',
+                  ),
+                  const SizedBox(height: 12),
+                  ShareDonutChart(slices: donutShares(snapshot.apps)),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          _AllAppsCard(
+            live: live,
+            installed: _installed,
+            activity: _activity,
+            isAndroidEngine: status.engine == 'network-stats',
+            loadIcon: _loadIcon,
+            iconCache: _iconCache,
+          ),
+          const SizedBox(height: 12),
+          GlassCard(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Live System Map',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 18,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'What is measurably connected right now — not a '
+                    'claim that apps share data with each other.',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                  const SizedBox(height: 12),
+                  SystemMapWidget(map: _buildSystemMap(live)),
+                ],
+              ),
+            ),
+          ),
           if (snapshot.connections.isNotEmpty) ...[
             const SizedBox(height: 12),
             _ConnectionsCard(snapshot: snapshot),
@@ -689,6 +918,10 @@ class HistoryTab extends StatefulWidget {
   const HistoryTab({
     super.key,
     required this.history,
+    required this.historyLoading,
+    required this.historyError,
+    required this.onRetryHistory,
+    required this.refreshToken,
     required this.budgetStore,
     required this.backgroundSource,
     required this.backgroundOn,
@@ -698,6 +931,19 @@ class HistoryTab extends StatefulWidget {
   });
 
   final HistoryStore? history;
+
+  /// True while the first history open is in flight.
+  final bool historyLoading;
+
+  /// Cause when the open fell back to in-memory, else null.
+  final String? historyError;
+
+  /// Re-attempts the SQLite open.
+  final VoidCallback onRetryHistory;
+
+  /// Bumped by the dashboard whenever the History tab is opened, so
+  /// the summary is re-read instead of serving a stale cached future.
+  final int refreshToken;
   final BudgetStore? budgetStore;
   final BackgroundSamplingSource? backgroundSource;
   final bool backgroundOn;
@@ -722,6 +968,18 @@ class _HistoryTabState extends State<HistoryTab> {
   }
 
   @override
+  void didUpdateWidget(covariant HistoryTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A new store, or the tab being reopened, invalidates the cache.
+    // The old code cached one future forever, so the tab went stale
+    // while live polling kept recording.
+    if (widget.history != oldWidget.history ||
+        widget.refreshToken != oldWidget.refreshToken) {
+      _summaryFuture = null;
+    }
+  }
+
+  @override
   void dispose() {
     _capController.dispose();
     super.dispose();
@@ -737,13 +995,81 @@ class _HistoryTabState extends State<HistoryTab> {
   Widget build(BuildContext context) {
     final history = widget.history;
     if (history == null) {
-      return const Center(child: CircularProgressIndicator());
+      // Phase 5: never a silent infinite spinner. Loading shows a
+      // label; a failed open shows its cause with a Retry.
+      if (widget.historyError != null) {
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            GlassCard(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Could not load history',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      widget.historyError!,
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton(
+                      onPressed: widget.onRetryHistory,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        );
+      }
+      return const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 12),
+            Text(
+              'Loading history…',
+              style: TextStyle(color: Colors.white70),
+            ),
+          ],
+        ),
+      );
     }
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (widget.historyError != null)
+          GlassCard(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.historyError!,
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: widget.onRetryHistory,
+                    child: const Text('Retry opening SQLite'),
+                  ),
+                ],
+              ),
+            ),
+          ),
         if (!history.isPersistent)
-          const Card(
+          const GlassCard(
             child: Padding(
               padding: EdgeInsets.all(16),
               child: Text(
@@ -762,7 +1088,7 @@ class _HistoryTabState extends State<HistoryTab> {
               );
             }
             if (snapshot.hasError || !snapshot.hasData) {
-              return Card(
+              return GlassCard(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Column(
@@ -773,9 +1099,17 @@ class _HistoryTabState extends State<HistoryTab> {
                         style: TextStyle(fontWeight: FontWeight.bold),
                       ),
                       const SizedBox(height: 8),
+                      if (snapshot.error != null)
+                        Text(
+                          snapshot.error.toString(),
+                          style: const TextStyle(color: Colors.white70),
+                        ),
+                      const SizedBox(height: 8),
                       FilledButton(
                         onPressed: () => setState(
-                          () => _summaryFuture = history.summary(),
+                          () {
+                            _summaryFuture = history.summary();
+                          },
                         ),
                         child: const Text('Retry'),
                       ),
@@ -801,7 +1135,9 @@ class _HistoryTabState extends State<HistoryTab> {
                     ),
                     TextButton(
                       onPressed: () => setState(
-                        () => _summaryFuture = history.summary(),
+                        () {
+                          _summaryFuture = history.summary();
+                        },
                       ),
                       child: const Text('Refresh'),
                     ),
@@ -816,6 +1152,27 @@ class _HistoryTabState extends State<HistoryTab> {
                 ),
                 const SizedBox(height: 12),
                 _HistoryTotalsCard(summary: summary),
+                const SizedBox(height: 12),
+                GlassCard(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const ChartCaption(
+                          question: 'How much was recorded each day?',
+                          note: 'Last 7 days, recorded while sampling '
+                              'only. A zero day means nothing was '
+                              'recorded, not that nothing was used.',
+                        ),
+                        const SizedBox(height: 12),
+                        DailyBarChart(
+                          bars: dailyBars(summary.last7Daily),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
                 const SizedBox(height: 12),
                 _HistoryPerAppCard(summary: summary),
               ],
@@ -1115,7 +1472,7 @@ class _DevicesTabState extends State<DevicesTab> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Card(
+        GlassCard(
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
@@ -1163,7 +1520,7 @@ class _DevicesTabState extends State<DevicesTab> {
         ),
         const SizedBox(height: 12),
         if (host != null) ...[
-          Card(
+          GlassCard(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
@@ -1177,10 +1534,16 @@ class _DevicesTabState extends State<DevicesTab> {
                   Text('Endpoint: ${host.endpoint}'),
                   const SizedBox(height: 12),
                   Center(
-                    child: QrImageView(
-                      data: host.pairingPayload,
-                      version: QrVersions.auto,
-                      size: 200,
+                    // White backing: the QR code must stay scannable
+                    // on the dark glass card (Phase 5 theme change).
+                    child: Container(
+                      color: Colors.white,
+                      padding: const EdgeInsets.all(12),
+                      child: QrImageView(
+                        data: host.pairingPayload,
+                        version: QrVersions.auto,
+                        size: 200,
+                      ),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -1232,7 +1595,7 @@ class _DevicesTabState extends State<DevicesTab> {
             ),
           ),
         ] else ...[
-          Card(
+          GlassCard(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
@@ -1264,7 +1627,7 @@ class _DevicesTabState extends State<DevicesTab> {
         ],
         const SizedBox(height: 12),
         if (_paired.isEmpty && host == null)
-          const Card(
+          const GlassCard(
             child: Padding(
               padding: EdgeInsets.all(16),
               child: Column(
@@ -1301,7 +1664,7 @@ class _DevicesTabState extends State<DevicesTab> {
             child: const Text('Join a device'),
           )
         else
-          Card(
+          GlassCard(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
@@ -1424,7 +1787,7 @@ class _RemoteDeviceCard extends StatelessWidget {
         ? const <AppUsage>[]
         : ([...snapshot.apps]
           ..sort((a, b) => b.totalBytes.compareTo(a.totalBytes))).take(5).toList();
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1520,7 +1883,7 @@ class _HistoryTotalsCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1567,7 +1930,7 @@ class _HistoryPerAppCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1616,14 +1979,14 @@ class _BudgetCardState extends State<_BudgetCard> {
   Widget build(BuildContext context) {
     final store = widget.budgetStore;
     if (store == null) {
-      return const Card(
+      return const GlassCard(
         child: Padding(
           padding: EdgeInsets.all(16),
           child: Text('Daily cap settings are unavailable here.'),
         ),
       );
     }
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1709,7 +2072,7 @@ class _BackgroundCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (backgroundSource == null) {
-      return const Card(
+      return const GlassCard(
         child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
@@ -1720,7 +2083,7 @@ class _BackgroundCard extends StatelessWidget {
         ),
       );
     }
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1770,7 +2133,7 @@ class _PermissionBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return GlassCard(
       color: Theme.of(context).colorScheme.errorContainer,
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -1805,7 +2168,7 @@ class _LiveRateCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1846,7 +2209,7 @@ class _TotalsCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1900,7 +2263,7 @@ class _NetworkSplitCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final mobile = snapshot.mobileRxBytes + snapshot.mobileTxBytes;
     final wifi = snapshot.totalBytes - mobile;
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1931,59 +2294,165 @@ class _NetworkSplitCard extends StatelessWidget {
   }
 }
 
-class _PerAppCard extends StatelessWidget {
-  const _PerAppCard({required this.live});
+class _AllAppsCard extends StatefulWidget {
+  const _AllAppsCard({
+    required this.live,
+    required this.installed,
+    required this.activity,
+    required this.isAndroidEngine,
+    required this.loadIcon,
+    required this.iconCache,
+  });
 
   final LiveUsage live;
+  final List<InstalledApp> installed;
+  final Map<String, AppActivity> activity;
+  final bool isAndroidEngine;
+  final Future<Uint8List?> Function(String packageName) loadIcon;
+  final Map<String, Uint8List?> iconCache;
+
+  @override
+  State<_AllAppsCard> createState() => _AllAppsCardState();
+}
+
+class _AllAppsCardState extends State<_AllAppsCard> {
+  AppListFilter _filter = AppListFilter.all;
 
   @override
   Widget build(BuildContext context) {
-    final apps = [...live.snapshot.apps];
-    apps.sort((a, b) {
-      final rateA = _rateOf(a.id);
-      final rateB = _rateOf(b.id);
-      if (rateB != rateA) return rateB.compareTo(rateA);
-      return b.totalBytes.compareTo(a.totalBytes);
-    });
-    return Card(
+    final rates = <String, double>{};
+    for (final entry in widget.live.appRates.entries) {
+      rates[entry.key] =
+          entry.value.rxPerSecond + entry.value.txPerSecond;
+    }
+    final merged = sortApps(
+      filterApps(
+        attachActivity(
+          mergeApps(
+            installed: widget.installed,
+            stats: widget.live.snapshot.apps,
+            rates: rates,
+          ),
+          widget.activity,
+        ),
+        _filter,
+      ),
+    );
+    final hasInstalledList = widget.installed.isNotEmpty;
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Per app',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+              'All apps',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 18,
+              ),
             ),
             const SizedBox(height: 4),
-            const Text(
-              'Sorted by current rate, then by total. On Android the '
-              'totals cover today (NetworkStatsManager window); on '
-              'Windows they cover tracked TCP connections since the '
-              'collector started.',
+            Text(
+              widget.isAndroidEngine
+                  ? (hasInstalledList
+                      ? 'Every installed app, including system apps. '
+                          'Apps with no data today show 0 / "No data '
+                          'today" — never hidden, never given fake '
+                          'bytes. Sorted by current rate, then total.'
+                      : 'Installed-apps list unavailable here — '
+                          'showing data users only. Grant usage '
+                          'access and reopen to load the full list.')
+                  : 'Processes seen by the collector (Windows) — '
+                      'not an installed-apps list, and no icons. '
+                      'Totals cover tracked TCP connections since '
+                      'the collector started.',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              children: [
+                for (final entry in const [
+                  (AppListFilter.all, 'All'),
+                  (AppListFilter.dataUsers, 'Data users only'),
+                  (AppListFilter.system, 'System'),
+                  (AppListFilter.userApps, 'User apps'),
+                ])
+                  ChoiceChip(
+                    label: Text(entry.$2),
+                    selected: _filter == entry.$1,
+                    onSelected: (_) =>
+                        setState(() => _filter = entry.$1),
+                  ),
+              ],
             ),
             const SizedBox(height: 8),
-            if (apps.isEmpty)
+            if (merged.isEmpty)
               const Text(
-                'No per-app data yet. On Android, grant usage access '
-                'above and keep the app open for a poll cycle. On '
-                'Windows, run as administrator for per-process bytes.',
+                'Nothing matches this filter yet.',
+                style: TextStyle(color: Colors.white70),
               )
             else
-              for (final app in apps)
+              for (final app in merged)
                 ListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: Text(app.name.isEmpty ? app.id : app.name),
-                  subtitle: Text(
-                    '↓ ${formatBytes(app.rxBytes)}  '
-                    '↑ ${formatBytes(app.txBytes)}',
+                  leading: widget.isAndroidEngine
+                      ? _AppIcon(
+                          packageName: app.id,
+                          fallbackLetter: app.name.isEmpty
+                              ? '?'
+                              : app.name[0].toUpperCase(),
+                          loadIcon: widget.loadIcon,
+                          iconCache: widget.iconCache,
+                        )
+                      : null,
+                  title: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          app.name,
+                          style: const TextStyle(color: Colors.white),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (app.isSystem)
+                        const Padding(
+                          padding: EdgeInsets.only(left: 6),
+                          child: _Badge(text: 'SYSTEM'),
+                        ),
+                      if (!app.enabled)
+                        const Padding(
+                          padding: EdgeInsets.only(left: 6),
+                          child: _Badge(text: 'DISABLED'),
+                        ),
+                    ],
+                  ),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        app.hasDataToday
+                            ? '↓ ${formatBytes(app.rxBytes)}  '
+                                '↑ ${formatBytes(app.txBytes)}'
+                            : 'No data today',
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                      Text(
+                        '${activityBadge(app, now: DateTime.now())}'
+                        '${app.activity != null && app.activity!.foregroundSeconds > 0 ? ' · ${(app.activity!.foregroundSeconds / 60).toStringAsFixed(0)} min foreground today' : ''}'
+                        '${app.activity != null && app.activity!.features.isNotEmpty ? ' · ${app.activity!.features.join(', ')}' : ''}',
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    ],
                   ),
                   trailing: Text(
-                    formatRate(
-                      _rateOf(app.id) +
-                          (live.appRates[app.id]?.txPerSecond ?? 0),
+                    formatRate(app.rateBytesPerSecond),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
                     ),
-                    style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
           ],
@@ -1991,11 +2460,78 @@ class _PerAppCard extends StatelessWidget {
       ),
     );
   }
+}
 
-  double _rateOf(String id) {
-    final r = live.appRates[id];
-    if (r == null) return 0;
-    return r.rxPerSecond + r.txPerSecond;
+class _Badge extends StatelessWidget {
+  const _Badge({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: glassGold.withOpacity(0.25),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: glassGold.withOpacity(0.5)),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 10,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+/// One app icon, loaded lazily for visible rows only. While loading
+/// (or when the native side has no icon) a letter placeholder shows,
+/// so the list never blocks on hundreds of icons.
+class _AppIcon extends StatefulWidget {
+  const _AppIcon({
+    required this.packageName,
+    required this.fallbackLetter,
+    required this.loadIcon,
+    required this.iconCache,
+  });
+
+  final String packageName;
+  final String fallbackLetter;
+  final Future<Uint8List?> Function(String packageName) loadIcon;
+  final Map<String, Uint8List?> iconCache;
+
+  @override
+  State<_AppIcon> createState() => _AppIconState();
+}
+
+class _AppIconState extends State<_AppIcon> {
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.iconCache.containsKey(widget.packageName)) {
+      widget.loadIcon(widget.packageName);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = widget.iconCache[widget.packageName];
+    if (bytes != null && bytes.isNotEmpty) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.memory(bytes, width: 40, height: 40),
+      );
+    }
+    return CircleAvatar(
+      radius: 20,
+      backgroundColor: glassIndigo,
+      foregroundColor: Colors.white,
+      child: Text(widget.fallbackLetter),
+    );
   }
 }
 
@@ -2006,7 +2542,7 @@ class _ConnectionsCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
+    return GlassCard(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -2104,7 +2640,7 @@ class _ReconciliationCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isMismatch = result.status == 'mismatch';
-    return Card(
+    return GlassCard(
       color: isMismatch
           ? Theme.of(context).colorScheme.errorContainer
           : null,

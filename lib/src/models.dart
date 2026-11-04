@@ -14,6 +14,8 @@ class AppUsage {
     required this.name,
     required this.rxBytes,
     required this.txBytes,
+    this.mobileRxBytes = -1,
+    this.mobileTxBytes = -1,
   });
 
   /// Android package name, or Windows process name + pid, e.g. `chrome.exe:1234`.
@@ -22,13 +24,35 @@ class AppUsage {
   final int rxBytes;
   final int txBytes;
 
+  /// Phase 5: per-app mobile split from NetworkStatsManager, when the
+  /// native side could measure it. -1 means unknown (Windows, VPN
+  /// snapshots, or a device whose mobile query returned nothing) —
+  /// never 0 presented as "used no mobile data".
+  final int mobileRxBytes;
+  final int mobileTxBytes;
+
   int get totalBytes => rxBytes + txBytes;
+
+  /// Wi-Fi / other bytes, derived as total − mobile, or -1 when the
+  /// mobile split is unknown. Derived, never measured directly.
+  int get wifiBytes {
+    if (mobileRxBytes < 0 || mobileTxBytes < 0) return -1;
+    final wifi = totalBytes - mobileRxBytes - mobileTxBytes;
+    return wifi < 0 ? 0 : wifi;
+  }
+
+  int get mobileBytes =>
+      mobileRxBytes < 0 || mobileTxBytes < 0
+          ? -1
+          : mobileRxBytes + mobileTxBytes;
 
   factory AppUsage.fromJson(Map<String, dynamic> json) => AppUsage(
         id: json['id'] as String? ?? '',
         name: json['name'] as String? ?? '',
         rxBytes: (json['rx'] as num?)?.toInt() ?? 0,
         txBytes: (json['tx'] as num?)?.toInt() ?? 0,
+        mobileRxBytes: (json['mobileRx'] as num?)?.toInt() ?? -1,
+        mobileTxBytes: (json['mobileTx'] as num?)?.toInt() ?? -1,
       );
 }
 

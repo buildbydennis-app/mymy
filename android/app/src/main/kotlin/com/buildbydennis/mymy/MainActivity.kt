@@ -17,7 +17,8 @@ import io.flutter.plugin.common.MethodChannel
  * and runs the Phase 3 VPN consent + live-mode flow.
  *
  * Contract (see lib/src/models.dart): cumulative counters only, no
- * network call, nothing leaves the device. No INTERNET permission.
+ * network call, nothing leaves the device. INTERNET is LAN-only
+ * (Phase 4 Devices tab); it is not used by any snapshot call here.
  *
  * VPN consent flow: [VpnService.prepare] returns null when consent
  * is already held (reply 'ready' at once) or an Intent otherwise. In
@@ -48,6 +49,52 @@ class MainActivity : FlutterActivity() {
                             "SNAPSHOT_FAILED",
                             e.message ?: "Failed to read usage counters",
                             null,
+                        )
+                    }
+                }
+                // Phase 5: installed list, activity, icons, battery.
+                // Every one degrades to empty/null on failure, so a
+                // missing signal can never invent an app or a badge.
+                "getInstalledApps" -> {
+                    try {
+                        result.success(
+                            UsageSnapshotProvider.getInstalledApps(this),
+                        )
+                    } catch (e: Exception) {
+                        result.success(emptyList<Map<String, Any>>())
+                    }
+                }
+                "getAppActivity" -> {
+                    try {
+                        result.success(
+                            UsageSnapshotProvider.getAppActivity(this),
+                        )
+                    } catch (e: Exception) {
+                        result.success(emptyList<Map<String, Any>>())
+                    }
+                }
+                "getAppIcon" -> {
+                    try {
+                        val pkg = call.arguments as? String
+                        val bytes = if (pkg.isNullOrEmpty()) {
+                            null
+                        } else {
+                            UsageSnapshotProvider.getAppIcon(this, pkg)
+                        }
+                        result.success(bytes)
+                    } catch (e: Exception) {
+                        result.success(null)
+                    }
+                }
+                "getBattery" -> {
+                    try {
+                        result.success(UsageSnapshotProvider.getBattery(this))
+                    } catch (e: Exception) {
+                        result.success(
+                            mapOf(
+                                "levelPercent" to -1,
+                                "charging" to false,
+                            ),
                         )
                     }
                 }

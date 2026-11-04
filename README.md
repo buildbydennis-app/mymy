@@ -5,6 +5,49 @@ internet usage per app in a live dashboard. See
 [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) for the full phased plan,
 including the honest platform limits.
 
+**Phase 5 status (local only, NOT pushed to GitHub):**
+
+- ✅ History loading fixed: a failed or hung SQLite open now falls
+  back to in-memory history with a visible cause and a Retry button
+  (15-second timeout) instead of a silent infinite spinner, and the
+  History summary refreshes when the tab is opened and after a
+  background merge, not only on manual Refresh. Recorded-while-
+  sampling meaning unchanged.
+- ✅ All-apps list (Android): every installed app, including system
+  apps (badged) and disabled apps, with lazy-loaded icons; apps
+  with no data today show 0 / "No data today", never hidden or
+  given fake bytes. Filters: All / Data users only / System / User
+  apps. Activity badges ("Foreground now" / "Background recently"
+  / "Not recently used") mean recent usage-stats activity, NOT a
+  claimed live process list. Windows still shows collector
+  processes only, labelled as such — no installed list or icons
+  claimed there.
+- ✅ Graphs: live rate line/area chart (last ~3 minutes), top-10
+  per-app bars, share donut, and a History daily bar chart (last
+  7 recorded days) — each captioned with the question it answers,
+  each showing "No data yet" when empty, never a sample curve.
+- ✅ Live System Map: device hub + live-rate app nodes sized by
+  rate, coloured by state, with a legend. **Plain-language
+  boundary: Android does not expose real-time inter-app data
+  sharing, so the map NEVER draws app-to-app "data sharing" lines.
+  Lines exist only for app → Mobile/Wi-Fi (measured per-transport
+  totals), app → a phone feature (AppOps actually reported it
+  allowed), and apps sharing one UID (a packaging fact, shown as
+  a "same app group" node). Battery is device-level only; there
+  are no per-app battery numbers anywhere.**
+- ✅ Glass corporate style: frosted-glass cards over a dark
+  navy/indigo gradient, indigo → cyan accent, white text — the
+  existing logo palette, not a rebrand.
+- ❌ **NOT proven:** nothing in Phase 5 has run on a real phone —
+  Kotlin is uncompiled here (no Android SDK), installed-list
+  completeness is unverified (QUERY_ALL_PACKAGES deliberately not
+  added — Android 11+ package visibility may filter the list),
+  AppOps feature badges may return nothing on some devices, icon
+  cost on a 200+ app phone is unmeasured, and map readability at
+  high app counts is untested. Do not claim history is fixed or
+  the map is real-time until a real phone proves it. Exact Phase 5
+  device tests are in the plan doc.
+
 **Phase 4 status (local only, NOT pushed to GitHub):**
 
 - ✅ Android: live dashboard, device totals, mobile vs Wi-Fi split,
