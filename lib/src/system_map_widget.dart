@@ -169,7 +169,7 @@ class _MapPainter extends CustomPainter {
 
     // Edges first, under the nodes.
     final edgePaint = Paint()
-      ..color = Colors.white.withOpacity(0.35)
+      ..color = Colors.white.withValues(alpha: 0.35)
       ..strokeWidth = 1.2;
     for (final edge in map.edges) {
       final from = positions[edge.fromId];
@@ -190,7 +190,7 @@ class _MapPainter extends CustomPainter {
         pos,
         radius,
         Paint()
-          ..color = Colors.white.withOpacity(0.25)
+          ..color = Colors.white.withValues(alpha: 0.25)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1,
       );

@@ -2472,9 +2472,9 @@ class _Badge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: glassGold.withOpacity(0.25),
+        color: glassGold.withValues(alpha: 0.25),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: glassGold.withOpacity(0.5)),
+        border: Border.all(color: glassGold.withValues(alpha: 0.5)),
       ),
       child: Text(
         text,

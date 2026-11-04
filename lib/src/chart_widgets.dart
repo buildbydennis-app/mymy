@@ -158,7 +158,7 @@ class _RatePainter extends CustomPainter {
       fill.close();
       canvas.drawPath(
         fill,
-        Paint()..color = color.withOpacity(0.18),
+        Paint()..color = color.withValues(alpha: 0.18),
       );
       canvas.drawPath(
         line,
